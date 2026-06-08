@@ -1,11 +1,4 @@
-"""Tests for deerflow.models.patched_mimo.PatchedMimoChatModel.
-
-Covers:
-- response parsing for ``reasoning_content``
-- streaming delta preservation
-- history replay with ``reasoning_content`` restoration
-- legacy-thread compatibility when old assistant turns are incomplete
-"""
+"""Tests for deerflow.models.patched_mimo.PatchedChatMiMo."""
 
 from __future__ import annotations
 
@@ -15,33 +8,52 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
 
 def _make_model(**kwargs):
-    from deerflow.models.patched_mimo import PatchedMimoChatModel
+    from deerflow.models.patched_mimo import PatchedChatMiMo
 
-    return PatchedMimoChatModel(
+    return PatchedChatMiMo(
         model="mimo-v2.5-pro",
         api_key="test-key",
-        base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        base_url="https://api.xiaomimimo.com/v1",
         **kwargs,
     )
 
 
-def _make_payload_message(role: str, content: str | None = None) -> dict:
-    return {"role": role, "content": content}
+def test_is_lc_serializable_returns_true():
+    from deerflow.models.patched_mimo import PatchedChatMiMo
+
+    assert PatchedChatMiMo.is_lc_serializable() is True
 
 
-def test_reasoning_content_injected_into_assistant_message():
+def test_lc_secrets_contains_mimo_api_key_mapping():
     model = _make_model()
 
-    human = HumanMessage(content="hi")
-    ai = AIMessage(
-        content="hello",
-        additional_kwargs={"reasoning_content": "internal reasoning"},
-    )
+    assert model.lc_secrets["api_key"] == "MIMO_API_KEY"
+    assert model.lc_secrets["openai_api_key"] == "MIMO_API_KEY"
 
+
+def test_reasoning_content_injected_into_assistant_tool_call_message():
+    model = _make_model()
+
+    human = HumanMessage(content="Check Beijing weather.")
+    ai = AIMessage(
+        content="",
+        additional_kwargs={"reasoning_content": "I need to call the weather tool."},
+    )
+    payload_message = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_weather",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"location":"Beijing"}'},
+            }
+        ],
+    }
     base_payload = {
         "messages": [
-            _make_payload_message("user", "hi"),
-            _make_payload_message("assistant", "hello"),
+            {"role": "user", "content": "Check Beijing weather."},
+            payload_message,
         ]
     }
 
@@ -50,75 +62,18 @@ def test_reasoning_content_injected_into_assistant_message():
             mock_convert.return_value = MagicMock(to_messages=lambda: [human, ai])
             payload = model._get_request_payload([human, ai])
 
-    assistant_msg = next(m for m in payload["messages"] if m["role"] == "assistant")
-    assert assistant_msg["reasoning_content"] == "internal reasoning"
+    assert payload["messages"][1]["reasoning_content"] == "I need to call the weather tool."
 
 
-def test_no_reasoning_content_plain_assistant_is_dropped_when_thinking_enabled():
+def test_reasoning_content_is_noop_when_missing():
     model = _make_model()
 
-    human = HumanMessage(content="hi")
-    ai = AIMessage(content="hello", additional_kwargs={})
-    followup = HumanMessage(content="continue")
-
+    human = HumanMessage(content="hello")
+    ai = AIMessage(content="hi", additional_kwargs={})
     base_payload = {
         "messages": [
-            _make_payload_message("user", "hi"),
-            _make_payload_message("assistant", "hello"),
-            _make_payload_message("user", "continue"),
-        ],
-        "extra_body": {"thinking": {"type": "enabled"}},
-    }
-
-    with patch.object(type(model).__bases__[0], "_get_request_payload", return_value=base_payload):
-        with patch.object(model, "_convert_input") as mock_convert:
-            mock_convert.return_value = MagicMock(to_messages=lambda: [human, ai, followup])
-            payload = model._get_request_payload([human, ai, followup])
-
-    assert payload["messages"] == [
-        _make_payload_message("user", "hi"),
-        _make_payload_message("user", "continue"),
-    ]
-
-
-def test_no_reasoning_content_plain_assistant_is_preserved_when_thinking_disabled():
-    model = _make_model()
-
-    human = HumanMessage(content="hi")
-    ai = AIMessage(content="hello", additional_kwargs={})
-    followup = HumanMessage(content="continue")
-
-    base_payload = {
-        "messages": [
-            _make_payload_message("user", "hi"),
-            _make_payload_message("assistant", "hello"),
-            _make_payload_message("user", "continue"),
-        ],
-        "extra_body": {"thinking": {"type": "disabled"}},
-    }
-
-    with patch.object(type(model).__bases__[0], "_get_request_payload", return_value=base_payload):
-        with patch.object(model, "_convert_input") as mock_convert:
-            mock_convert.return_value = MagicMock(to_messages=lambda: [human, ai, followup])
-            payload = model._get_request_payload([human, ai, followup])
-
-    assert payload["messages"] == base_payload["messages"]
-
-
-def test_positional_fallback_when_count_differs():
-    model = _make_model()
-
-    human = HumanMessage(content="hi")
-    ai = AIMessage(
-        content="hello",
-        additional_kwargs={"reasoning_content": "carry me forward"},
-    )
-
-    base_payload = {
-        "messages": [
-            _make_payload_message("system", "You are helpful."),
-            _make_payload_message("user", "hi"),
-            _make_payload_message("assistant", "hello"),
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
         ]
     }
 
@@ -127,120 +82,19 @@ def test_positional_fallback_when_count_differs():
             mock_convert.return_value = MagicMock(to_messages=lambda: [human, ai])
             payload = model._get_request_payload([human, ai])
 
-    assistant_msg = next(m for m in payload["messages"] if m["role"] == "assistant")
-    assert assistant_msg["reasoning_content"] == "carry me forward"
+    assert "reasoning_content" not in payload["messages"][1]
 
 
-def test_legacy_assistant_without_reasoning_is_dropped_with_tool_result_when_thinking_enabled():
-    model = _make_model()
-
-    human = HumanMessage(content="hi")
-    legacy_ai = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "get_weather",
-                "args": {"city": "Beijing"},
-                "id": "call_legacy",
-                "type": "tool_call",
-            }
-        ],
-        additional_kwargs={},
-    )
-    followup = HumanMessage(content="continue")
-
-    base_payload = {
-        "messages": [
-            _make_payload_message("user", "hi"),
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "call_legacy",
-                        "type": "function",
-                        "function": {
-                            "name": "get_weather",
-                            "arguments": '{"city":"Beijing"}',
-                        },
-                    }
-                ],
-            },
-            {"role": "tool", "tool_call_id": "call_legacy", "content": '{"temp": 20}'},
-            _make_payload_message("user", "continue"),
-        ],
-        "extra_body": {"thinking": {"type": "enabled"}},
-    }
-
-    with patch.object(type(model).__bases__[0], "_get_request_payload", return_value=base_payload):
-        with patch.object(model, "_convert_input") as mock_convert:
-            mock_convert.return_value = MagicMock(to_messages=lambda: [human, legacy_ai, followup])
-            payload = model._get_request_payload([human, legacy_ai, followup])
-
-    assert payload["messages"] == [
-        _make_payload_message("user", "hi"),
-        _make_payload_message("user", "continue"),
-    ]
-
-
-def test_legacy_assistant_without_reasoning_is_preserved_when_thinking_disabled():
-    model = _make_model()
-
-    human = HumanMessage(content="hi")
-    legacy_ai = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "get_weather",
-                "args": {"city": "Beijing"},
-                "id": "call_legacy",
-                "type": "tool_call",
-            }
-        ],
-        additional_kwargs={},
-    )
-    followup = HumanMessage(content="continue")
-
-    base_payload = {
-        "messages": [
-            _make_payload_message("user", "hi"),
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "call_legacy",
-                        "type": "function",
-                        "function": {
-                            "name": "get_weather",
-                            "arguments": '{"city":"Beijing"}',
-                        },
-                    }
-                ],
-            },
-            {"role": "tool", "tool_call_id": "call_legacy", "content": '{"temp": 20}'},
-            _make_payload_message("user", "continue"),
-        ],
-        "extra_body": {"thinking": {"type": "disabled"}},
-    }
-
-    with patch.object(type(model).__bases__[0], "_get_request_payload", return_value=base_payload):
-        with patch.object(model, "_convert_input") as mock_convert:
-            mock_convert.return_value = MagicMock(to_messages=lambda: [human, legacy_ai, followup])
-            payload = model._get_request_payload([human, legacy_ai, followup])
-
-    assert payload["messages"] == base_payload["messages"]
-
-
-def test_create_chat_result_maps_reasoning_content_to_additional_kwargs():
+def test_create_chat_result_maps_message_reasoning_content():
     model = _make_model()
     response = {
         "choices": [
             {
                 "message": {
                     "role": "assistant",
-                    "content": "final answer",
-                    "reasoning_content": "step by step reasoning",
+                    "content": "The weather is sunny.",
+                    "reasoning_content": "The tool returned sunny weather, so answer directly.",
+                    "tool_calls": None,
                 },
                 "finish_reason": "stop",
             }
@@ -251,55 +105,56 @@ def test_create_chat_result_maps_reasoning_content_to_additional_kwargs():
     result = model._create_chat_result(response)
     message = result.generations[0].message
 
-    assert message.content == "final answer"
-    assert message.additional_kwargs["reasoning_content"] == "step by step reasoning"
-    assert result.generations[0].text == "final answer"
+    assert message.content == "The weather is sunny."
+    assert message.additional_kwargs["reasoning_content"] == "The tool returned sunny weather, so answer directly."
+
+
+def test_create_chat_result_reads_reasoning_content_from_message_attribute():
+    model = _make_model()
+
+    class FakeMessage:
+        reasoning_content = "Reasoning stored on the SDK message object."
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+        def model_dump(self, **kwargs):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Answer.",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "model": "mimo-v2.5-pro",
+            }
+
+    result = model._create_chat_result(FakeResponse())
+
+    assert result.generations[0].message.additional_kwargs["reasoning_content"] == "Reasoning stored on the SDK message object."
 
 
 def test_convert_chunk_to_generation_chunk_preserves_reasoning_deltas():
     model = _make_model()
 
     first = model._convert_chunk_to_generation_chunk(
-        {
-            "choices": [
-                {
-                    "delta": {
-                        "role": "assistant",
-                        "content": "",
-                        "reasoning_content": "First, ",
-                    }
-                }
-            ]
-        },
+        {"choices": [{"delta": {"role": "assistant", "reasoning_content": "I need "}}]},
         AIMessageChunk,
         {},
     )
     second = model._convert_chunk_to_generation_chunk(
-        {
-            "choices": [
-                {
-                    "delta": {
-                        "content": "",
-                        "reasoning_content": "think carefully.",
-                    }
-                }
-            ]
-        },
+        {"choices": [{"delta": {"reasoning_content": "a tool."}}]},
         AIMessageChunk,
         {},
     )
     answer = model._convert_chunk_to_generation_chunk(
-        {
-            "choices": [
-                {
-                    "delta": {
-                        "content": "final answer",
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "model": "mimo-v2.5-pro",
-        },
+        {"choices": [{"delta": {"content": "Done."}, "finish_reason": "stop"}], "model": "mimo-v2.5-pro"},
         AIMessageChunk,
         {},
     )
@@ -309,5 +164,6 @@ def test_convert_chunk_to_generation_chunk_preserves_reasoning_deltas():
     assert answer is not None
 
     combined = first.message + second.message + answer.message
-    assert combined.additional_kwargs["reasoning_content"] == "First, think carefully."
-    assert combined.content == "final answer"
+
+    assert combined.additional_kwargs["reasoning_content"] == "I need a tool."
+    assert combined.content == "Done."
