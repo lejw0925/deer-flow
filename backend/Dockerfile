@@ -72,6 +72,12 @@ CMD ["sh", "-c", "cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app 
 # Clean image without build-essential — reduces size (~200 MB) and attack surface.
 FROM python:3.12-slim-bookworm
 
+RUN apt-get update && apt-get install -y \
+    libreoffice-writer-nogui \
+    libreoffice-common \
+    libreoffice-core-nogui \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV PYTHONIOENCODING=utf-8

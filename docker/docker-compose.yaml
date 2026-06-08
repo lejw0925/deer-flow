@@ -75,8 +75,9 @@ services:
     command: sh -c "cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 --workers ${GATEWAY_WORKERS:-4}"
     volumes:
       - ${DEER_FLOW_CONFIG_PATH}:/app/backend/config.yaml:ro
-      - ${DEER_FLOW_EXTENSIONS_CONFIG_PATH}:/app/backend/extensions_config.json:ro
-      - ../skills:/app/skills:ro
+      - ${DEER_FLOW_EXTENSIONS_CONFIG_PATH}:/app/backend/extensions_config.json:rw
+      - ../skills:/app/skills:rw
+      - ../backend/packages/harness/deerflow/community/jina_reader_local:/app/backend/packages/harness/deerflow/community/jina_reader_local:rw
       - ${DEER_FLOW_HOME}:/app/backend/.deer-flow
       # DooD: AioSandboxProvider starts sandbox containers via host Docker daemon
       - ${DEER_FLOW_DOCKER_SOCKET}:/var/run/docker.sock
@@ -96,6 +97,9 @@ services:
     working_dir: /app
     environment:
       - CI=true
+      - HTTP_PROXY=http://host.docker.internal:7897
+      - HTTPS_PROXY=http://host.docker.internal:7897
+      - NO_PROXY=localhost,127.0.0.1,gateway,frontend,nginx,deer-flow,172.18.0.0/16,172.17.0.0/16,10.0.0.0/8,192.168.0.0/16,.local
       - DEER_FLOW_PROJECT_ROOT=/app
       - DEER_FLOW_HOME=/app/backend/.deer-flow
       - DEER_FLOW_CONFIG_PATH=/app/backend/config.yaml
@@ -114,6 +118,21 @@ services:
     networks:
       - deer-flow
     restart: unless-stopped
+
+  # ── Jina Reader (self-hosted, free web fetch) ────────────────────────────
+  jina-reader:
+    image: ghcr.io/jina-ai/reader:oss
+    container_name: deer-flow-jina-reader
+    hostname: jina-reader
+    networks:
+      - deer-flow
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/https://example.com"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   # ── Sandbox Provisioner (optional, Kubernetes mode) ────────────────────────
   provisioner:

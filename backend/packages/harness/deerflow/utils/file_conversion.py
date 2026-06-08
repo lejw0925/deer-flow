@@ -17,6 +17,9 @@ No FastAPI or HTTP dependencies — pure utility functions.
 import asyncio
 import logging
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 from deerflow.config.app_config import get_app_config
@@ -94,6 +97,59 @@ def _convert_pdf_with_pymupdf4llm(file_path: Path) -> str | None:
         return None
 
 
+def _convert_doc_to_docx(file_path: Path) -> Path | None:
+    """Convert .doc (OLE2) to .docx (OOXML) via LibreOffice headless.
+
+    Returns the path to the generated .docx file, or None if LibreOffice
+    is unavailable or conversion fails.
+    """
+    if shutil.which("soffice") is None:
+        logger.warning("LibreOffice (soffice) not found; skipping .doc -> .docx conversion for %s", file_path.name)
+        return None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cmd = [
+            "soffice",
+            "--headless",
+            "--convert-to", "docx",
+            "--outdir", tmpdir,
+            str(file_path),
+        ]
+        logger.info("Converting .doc -> .docx: %s", file_path.name)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                logger.error(
+                    "LibreOffice failed to convert %s: stdout=%s stderr=%s",
+                    file_path.name,
+                    result.stdout,
+                    result.stderr,
+                )
+                return None
+        except subprocess.TimeoutExpired:
+            logger.error("LibreOffice timed out converting %s", file_path.name)
+            return None
+        except Exception:
+            logger.exception("LibreOffice error converting %s", file_path.name)
+            return None
+
+        # LibreOffice writes <stem>.docx into tmpdir
+        expected = Path(tmpdir) / file_path.with_suffix(".docx").name
+        if expected.is_file():
+            # Copy out of tempdir before it vanishes (handles cross-device moves)
+            final = file_path.parent / expected.name
+            shutil.copy2(str(expected), str(final))
+            logger.info("Converted %s -> %s", file_path.name, final.name)
+            return final
+        logger.error("LibreOffice did not produce expected output for %s", file_path.name)
+        return None
+
+
 def _convert_with_markitdown(file_path: Path) -> str:
     """Convert any supported file to markdown text using MarkItDown."""
     from markitdown import MarkItDown
@@ -109,6 +165,13 @@ def _do_convert(file_path: Path, pdf_converter: str) -> str:
         file_path: Path to the file.
         pdf_converter: "auto" | "pymupdf4llm" | "markitdown"
     """
+    # .doc (OLE2) -> .docx (OOXML) pre-conversion so MarkItDown can read it.
+    if file_path.suffix.lower() == ".doc":
+        docx_path = _convert_doc_to_docx(file_path)
+        if docx_path is not None:
+            file_path = docx_path
+        # if conversion fails, fall through and let MarkItDown raise a clear error
+
     is_pdf = file_path.suffix.lower() == ".pdf"
 
     if is_pdf and pdf_converter != "markitdown":

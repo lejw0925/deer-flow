@@ -80,9 +80,14 @@ class ChannelStore:
     # -- public API --------------------------------------------------------
 
     def get_thread_id(self, channel_name: str, chat_id: str, topic_id: str | None = None) -> str | None:
-        """Look up the DeerFlow thread_id for a given IM conversation/topic."""
-        entry = self._data.get(self._key(channel_name, chat_id, topic_id))
-        return entry["thread_id"] if entry else None
+        """Look up the DeerFlow thread_id for a given IM conversation/topic.
+
+        Reloads from disk first so that concurrent workers see each other's writes.
+        """
+        with self._lock:
+            self._data = self._load()
+            entry = self._data.get(self._key(channel_name, chat_id, topic_id))
+            return entry["thread_id"] if entry else None
 
     def set_thread_id(
         self,
@@ -93,8 +98,13 @@ class ChannelStore:
         topic_id: str | None = None,
         user_id: str = "",
     ) -> None:
-        """Create or update the mapping for an IM conversation/topic."""
+        """Create or update the mapping for an IM conversation/topic.
+
+        Reloads from disk before writing so that concurrent workers do not
+        overwrite each other's updates.
+        """
         with self._lock:
+            self._data = self._load()
             key = self._key(channel_name, chat_id, topic_id)
             now = time.time()
             existing = self._data.get(key)
@@ -113,9 +123,12 @@ class ChannelStore:
         If ``topic_id`` is omitted, all mappings whose key starts with
         ``"<channel_name>:<chat_id>"`` (including topic-specific ones) are removed.
 
+        Reloads from disk first so that concurrent workers see each other's writes.
+
         Returns True if at least one mapping was removed.
         """
         with self._lock:
+            self._data = self._load()
             # Remove a specific conversation/topic mapping.
             if topic_id is not None:
                 key = self._key(channel_name, chat_id, topic_id)

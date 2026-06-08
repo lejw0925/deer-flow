@@ -356,8 +356,7 @@ export function InputBox({
 
   const showFollowups =
     !disabled &&
-    !disabled &&
-    !isNewThread &&
+    !isWelcomeMode &&
     !isNarrow &&
     !followupsHidden &&
     (followupsLoading || followups.length > 0);

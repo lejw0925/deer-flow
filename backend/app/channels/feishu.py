@@ -591,8 +591,11 @@ class FeishuChannel(Channel):
             msg_id = message.message_id
             sender_id = event.event.sender.sender_id.open_id
 
+            # thread_id is Feishu's native thread identifier (topic groups).
             # root_id is set when the message is a reply within a Feishu thread.
-            # Use it as topic_id so all replies share the same DeerFlow thread.
+            # Use thread_id first, then root_id, to keep messages in the same DeerFlow thread.
+            chat_type = getattr(message, "chat_type", None)
+            thread_id = getattr(message, "thread_id", None) or None
             root_id = getattr(message, "root_id", None) or None
 
             # Parse message content
@@ -654,9 +657,11 @@ class FeishuChannel(Channel):
             text = text.strip()
 
             logger.info(
-                "[Feishu] parsed message: chat_id=%s, msg_id=%s, root_id=%s, sender=%s, text=%r",
+                "[Feishu] parsed message: chat_id=%s, msg_id=%s, chat_type=%s, thread_id=%s, root_id=%s, sender=%s, text=%r",
                 chat_id,
                 msg_id,
+                chat_type,
+                thread_id,
                 root_id,
                 sender_id,
                 text[:100] if text else "",
@@ -673,8 +678,20 @@ class FeishuChannel(Channel):
             else:
                 msg_type = InboundMessageType.CHAT
 
-            # topic_id: use root_id for replies (same topic), msg_id for new messages (new topic)
-            topic_id = root_id or msg_id
+            # topic_id determines which DeerFlow thread the message maps to.
+            # - Single chat (p2p): each new message starts a fresh thread so that
+            #   every standalone message is answered independently.  If the user
+            #   explicitly replies to an earlier message, root_id is non-empty and
+            #   we reuse that thread so the follow-up has context.
+            # - Group chat with thread_id (topic): same Feishu topic → same DeerFlow thread
+            # - Group chat reply (root_id): same reply chain → same DeerFlow thread
+            # - Group chat new message: each message starts a new thread
+            if chat_type == "p2p":
+                topic_id = root_id or msg_id
+            elif thread_id:
+                topic_id = thread_id
+            else:
+                topic_id = root_id or msg_id
 
             inbound = self._make_inbound(
                 chat_id=chat_id,
@@ -683,7 +700,7 @@ class FeishuChannel(Channel):
                 msg_type=msg_type,
                 thread_ts=msg_id,
                 files=files_list,
-                metadata={"message_id": msg_id, "root_id": root_id},
+                metadata={"message_id": msg_id, "root_id": root_id, "thread_id": thread_id, "chat_type": chat_type},
             )
             inbound.topic_id = topic_id
 

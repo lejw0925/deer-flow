@@ -295,12 +295,14 @@ if [ "$CMD" = "start" ]; then
     echo ""
     # shellcheck disable=SC2086
     "${COMPOSE_CMD[@]}" up -d --remove-orphans $services
+    sleep 3 && docker network connect bridge deer-flow-gateway 2>/dev/null || true
 else
     # Default: build + start
     echo "Building images and starting containers..."
     echo ""
     # shellcheck disable=SC2086
     "${COMPOSE_CMD[@]}" up --build -d --remove-orphans $services
+    sleep 3 && docker network connect bridge deer-flow-gateway 2>/dev/null || true
 fi
 
 echo ""

@@ -26,6 +26,8 @@ def test_feishu_on_message_plain_text():
     event = MagicMock()
     event.event.message.chat_id = "chat_1"
     event.event.message.message_id = "msg_1"
+    event.event.message.chat_type = "p2p"
+    event.event.message.thread_id = None
     event.event.message.root_id = None
     event.event.sender.sender_id.open_id = "user_1"
 
@@ -56,6 +58,8 @@ def test_feishu_on_message_rich_text():
     event = MagicMock()
     event.event.message.chat_id = "chat_1"
     event.event.message.message_id = "msg_1"
+    event.event.message.chat_type = "p2p"
+    event.event.message.thread_id = None
     event.event.message.root_id = None
     event.event.sender.sender_id.open_id = "user_1"
 
@@ -110,6 +114,8 @@ def test_feishu_on_message_extracts_image_and_file_keys():
     event = MagicMock()
     event.event.message.chat_id = "chat_1"
     event.event.message.message_id = "msg_1"
+    event.event.message.chat_type = "p2p"
+    event.event.message.thread_id = None
     event.event.message.root_id = None
     event.event.sender.sender_id.open_id = "user_1"
 
@@ -148,6 +154,8 @@ def test_feishu_recognizes_all_known_slash_commands(command):
     event = MagicMock()
     event.event.message.chat_id = "chat_1"
     event.event.message.message_id = "msg_1"
+    event.event.message.chat_type = "p2p"
+    event.event.message.thread_id = None
     event.event.message.root_id = None
     event.event.sender.sender_id.open_id = "user_1"
     event.event.message.content = json.dumps({"text": command})
@@ -179,6 +187,8 @@ def test_feishu_treats_unknown_slash_text_as_chat(text):
     event = MagicMock()
     event.event.message.chat_id = "chat_1"
     event.event.message.message_id = "msg_1"
+    event.event.message.chat_type = "p2p"
+    event.event.message.thread_id = None
     event.event.message.root_id = None
     event.event.sender.sender_id.open_id = "user_1"
     event.event.message.content = json.dumps({"text": text})

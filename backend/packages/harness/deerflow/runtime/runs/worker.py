@@ -249,6 +249,8 @@ async def run_agent(
         # Resolve after runtime context installation so context/configurable reflect
         # the agent name that this run will actually execute.
         config.setdefault("run_name", resolve_root_run_name(config, record.assistant_id))
+        # Prevent premature termination on long iterative runs (e.g. tool loops).
+        config.setdefault("recursion_limit", 250)
         runnable_config = RunnableConfig(**config)
         if ctx.app_config is not None and _agent_factory_supports_app_config(agent_factory):
             agent = agent_factory(config=runnable_config, app_config=ctx.app_config)
