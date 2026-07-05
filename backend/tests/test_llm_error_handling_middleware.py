@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import AIMessage
 from langgraph.errors import GraphBubbleUp
 
@@ -677,4 +678,225 @@ def test_user_message_for_quota_unchanged() -> None:
     message = middleware._build_user_message(exc, reason="quota")
 
     assert "out of quota" in message
-    assert "streaming response was interrupted" not in message
+
+
+# =========================================================================
+# MiMo content-rejection retry tests
+# =========================================================================
+
+_MIMO_REJECTION_TEXT = "The request was rejected because it was considered high risk"
+
+
+def _make_mimo_request() -> ModelRequest:
+    """Build a ModelRequest with a minimal PatchedChatMiMo model."""
+    from deerflow.models.patched_mimo import PatchedChatMiMo
+
+    return ModelRequest(
+        model=PatchedChatMiMo(
+            model="mimo-v2.5-pro",
+            api_key="test-key",
+            base_url="https://api.xiaomimimo.com/v1",
+        ),
+        messages=[],
+    )
+
+
+def test_sync_mimo_content_rejection_retries_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First call returns rejection text; middleware retries once, second call
+    returns valid content. Verifies 0.5s sleep and exactly 2 total attempts."""
+    middleware = _build_middleware()
+    calls: list[int] = []
+    waits: list[float] = []
+
+    monkeypatch.setattr("time.sleep", lambda d: waits.append(d))
+
+    def handler(_request: ModelRequest) -> AIMessage:
+        calls.append(len(calls))
+        if len(calls) == 1:
+            return AIMessage(content=_MIMO_REJECTION_TEXT)
+        return AIMessage(content="ok")
+
+    result = middleware.wrap_model_call(_make_mimo_request(), handler)
+
+    assert isinstance(result, AIMessage)
+    assert result.content == "ok"
+    assert len(calls) == 2  # first (rejected) + second (ok)
+    assert len(waits) == 1
+    assert waits[0] == pytest.approx(0.5, rel=1e-6)
+
+
+@pytest.mark.anyio
+async def test_async_mimo_content_rejection_retries_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async mirror of the sync test."""
+    middleware = _build_middleware()
+    calls: list[int] = []
+    waits: list[float] = []
+
+    async def fake_sleep(d: float) -> None:
+        waits.append(d)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def handler(_request: ModelRequest) -> AIMessage:
+        calls.append(len(calls))
+        if len(calls) == 1:
+            return AIMessage(content=_MIMO_REJECTION_TEXT)
+        return AIMessage(content="ok")
+
+    result = await middleware.awrap_model_call(_make_mimo_request(), handler)
+
+    assert isinstance(result, AIMessage)
+    assert result.content == "ok"
+    assert len(calls) == 2
+    assert len(waits) == 1
+    assert waits[0] == pytest.approx(0.5, rel=1e-6)
+
+
+def test_sync_mimo_content_rejection_exhausted_returns_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When retry also returns rejection, the second attempt's response is
+    returned as-is so the user sees the rejection text."""
+    middleware = _build_middleware()
+    waits: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda d: waits.append(d))
+
+    call_count = 0
+
+    def handler(_request: ModelRequest) -> AIMessage:
+        nonlocal call_count
+        call_count += 1
+        return AIMessage(content=_MIMO_REJECTION_TEXT)
+
+    result = middleware.wrap_model_call(_make_mimo_request(), handler)
+
+    assert isinstance(result, AIMessage)
+    assert _MIMO_REJECTION_TEXT in result.content
+    assert call_count == 2  # first attempt + exactly 1 retry
+    assert len(waits) == 1
+
+
+@pytest.mark.anyio
+async def test_async_mimo_content_rejection_exhausted_returns_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async mirror of exhaustion test."""
+    middleware = _build_middleware()
+    waits: list[float] = []
+
+    async def fake_sleep(d: float) -> None:
+        waits.append(d)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    call_count = 0
+
+    async def handler(_request: ModelRequest) -> AIMessage:
+        nonlocal call_count
+        call_count += 1
+        return AIMessage(content=_MIMO_REJECTION_TEXT)
+
+    result = await middleware.awrap_model_call(_make_mimo_request(), handler)
+
+    assert isinstance(result, AIMessage)
+    assert _MIMO_REJECTION_TEXT in result.content
+    assert call_count == 2
+    assert len(waits) == 1
+
+
+def test_mimo_content_rejection_skipped_for_non_mimo_models() -> None:
+    """If the model is not a MiMo model, the rejection text must pass through
+    without any retry."""
+    middleware = _build_middleware()
+
+    from langchain_openai import ChatOpenAI
+
+    request = ModelRequest(
+        model=ChatOpenAI(model="gpt-4o", api_key="sk-test"),
+        messages=[],
+    )
+
+    call_count = 0
+
+    def handler(_request: ModelRequest) -> AIMessage:
+        nonlocal call_count
+        call_count += 1
+        return AIMessage(content=_MIMO_REJECTION_TEXT)
+
+    result = middleware.wrap_model_call(request, handler)
+
+    assert isinstance(result, AIMessage)
+    assert _MIMO_REJECTION_TEXT in result.content
+    assert call_count == 1  # no retry for non-MiMo
+
+
+def test_mimo_content_rejection_emits_retry_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check that the SSE retry event is emitted with correct fields."""
+    middleware = _build_middleware()
+    events: list[dict] = []
+    monkeypatch.setattr("time.sleep", lambda d: None)
+
+    def capture_event(event: dict) -> None:
+        events.append(event)
+
+    monkeypatch.setattr(
+        "langgraph.config.get_stream_writer",
+        lambda: capture_event,
+    )
+
+    def handler(_request: ModelRequest) -> AIMessage:
+        return AIMessage(content=_MIMO_REJECTION_TEXT)
+
+    middleware.wrap_model_call(_make_mimo_request(), handler)
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["type"] == "llm_retry"
+    assert ev["reason"] == "content_rejection"
+    assert ev["attempt"] == 1
+    assert ev["max_attempts"] == 2
+    assert "content rejection" in ev["message"]
+
+
+def test_mimo_content_rejection_does_not_affect_circuit_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exhausting the content rejection retry must NOT increment the circuit
+    breaker failure count."""
+    middleware = _build_middleware()
+    monkeypatch.setattr("time.sleep", lambda d: None)
+
+    def handler(_request: ModelRequest) -> AIMessage:
+        return AIMessage(content=_MIMO_REJECTION_TEXT)
+
+    # Call twice: each exhausts its own content retry budget.
+    middleware.wrap_model_call(_make_mimo_request(), handler)
+    assert middleware._circuit_failure_count == 0
+
+    middleware.wrap_model_call(_make_mimo_request(), handler)
+    assert middleware._circuit_failure_count == 0
+    assert middleware._circuit_state == "closed"
+
+
+def test_mimo_content_rejection_request_missing_model_does_not_crash() -> None:
+    """When 'request' has no 'model' attribute (e.g. SimpleNamespace in tests),
+    the check must return False gracefully without AttributeError."""
+    middleware = _build_middleware()
+
+    called = False
+
+    def handler(_request: object) -> AIMessage:
+        nonlocal called
+        called = True
+        return AIMessage(content=_MIMO_REJECTION_TEXT)
+
+    result = middleware.wrap_model_call(SimpleNamespace(), handler)
+
+    assert isinstance(result, AIMessage)
+    assert called

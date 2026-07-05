@@ -117,6 +117,7 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - deer-flow
+      - searxnet
     restart: unless-stopped
 
   # ── Jina Reader (self-hosted, free web fetch) ────────────────────────────
@@ -168,3 +169,5 @@ services:
 networks:
   deer-flow:
     driver: bridge
+  searxnet:
+    external: true

@@ -97,6 +97,19 @@ _STREAM_DROP_EXCEPTIONS: frozenset[str] = frozenset(
     }
 )
 
+# MiMo high-risk content rejection retry.
+# The MiMo provider sometimes returns the literal text below as an AIMessage
+# content string — not as an HTTP error or finish_reason signal. This phrase
+# is checked via substring match ("in") so leading/trailing whitespace or
+# minor formatting variations do not cause a miss.
+_MIMO_CONTENT_REJECTION_PHRASE = "The request was rejected because it was considered high risk"
+_MIMO_CONTENT_MAX_ATTEMPTS = 2  # First attempt + exactly 1 retry
+_MIMO_CONTENT_RETRY_SLEEP_SEC = 0.5
+# Class names whose response content is checked for the rejection phrase.
+# Using class name (not isinstance) avoids import-time coupling with PatchedChatMiMo
+# and follows the existing pattern of _RETRY_BUDGET_OVERRIDES / _STREAM_DROP_EXCEPTIONS.
+_MIMO_MODEL_CLASS_NAMES: frozenset[str] = frozenset({"PatchedChatMiMo"})
+
 
 class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
     """Retry transient LLM errors and surface graceful assistant messages."""
@@ -217,10 +230,50 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         backoff = self.retry_base_delay_ms * (2 ** max(0, attempt - 1))
         return min(backoff, self.retry_cap_delay_ms)
 
-    def _build_retry_message(self, attempt: int, wait_ms: int, reason: str) -> str:
+    def _is_mimo_content_rejection(self, response: object, request: object) -> bool:
+        """Check if the model returned a MiMo high-risk rejection as text content.
+
+        Args:
+            response: The return value from ``handler(request)`` —
+                typically ``ModelResponse`` or ``AIMessage``.
+            request: The ``ModelRequest`` passed to ``wrap_model_call``; used to
+                check the model class name.
+
+        Returns:
+            ``True`` when the model is a recognised MiMo class AND the response
+            contains the high-risk rejection phrase as ``AIMessage`` content.
+        """
+        # 1. Guard: only apply to recognised MiMo model classes.
+        model = getattr(request, "model", None)
+        if model is None:
+            return False
+        if type(model).__name__ not in _MIMO_MODEL_CLASS_NAMES:
+            return False
+
+        # 2. Extract the AIMessage content from the response.
+        content: object = None
+        if isinstance(response, AIMessage):
+            content = response.content
+        elif isinstance(response, ModelResponse) and response.result:
+            first = response.result[0]
+            if isinstance(first, AIMessage):
+                content = first.content
+
+        # 3. Substring match against the known rejection phrase.
+        return isinstance(content, str) and _MIMO_CONTENT_REJECTION_PHRASE in content
+
+    def _build_retry_message(self, attempt: int, wait_ms: int, reason: str, max_attempts: int | None = None) -> str:
         seconds = max(1, round(wait_ms / 1000))
-        reason_text = "provider is busy" if reason == "busy" else "provider request failed temporarily"
-        return f"LLM request retry {attempt}/{self.retry_max_attempts}: {reason_text}. Retrying in {seconds}s."
+        effective_max = max_attempts if max_attempts is not None else self.retry_max_attempts
+
+        if reason == "busy":
+            reason_text = "provider is busy"
+        elif reason == "content_rejection":
+            reason_text = "content rejection detected"
+        else:
+            reason_text = "provider request failed temporarily"
+
+        return f"LLM request retry {attempt}/{effective_max}: {reason_text}. Retrying in {seconds}s."
 
     def _build_circuit_breaker_message(self) -> str:
         return "The configured LLM provider is currently unavailable due to continuous failures. Circuit breaker is engaged to protect the system. Please wait a moment before trying again."
@@ -275,7 +328,8 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
             detail=_extract_error_detail(exc),
         )
 
-    def _emit_retry_event(self, attempt: int, wait_ms: int, reason: str) -> None:
+    def _emit_retry_event(self, attempt: int, wait_ms: int, reason: str, max_attempts: int | None = None) -> None:
+        effective_max = max_attempts if max_attempts is not None else self.retry_max_attempts
         try:
             from langgraph.config import get_stream_writer
 
@@ -284,10 +338,10 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                 {
                     "type": "llm_retry",
                     "attempt": attempt,
-                    "max_attempts": self.retry_max_attempts,
+                    "max_attempts": effective_max,
                     "wait_ms": wait_ms,
                     "reason": reason,
-                    "message": self._build_retry_message(attempt, wait_ms, reason),
+                    "message": self._build_retry_message(attempt, wait_ms, reason, max_attempts=effective_max),
                 }
             )
         except Exception:
@@ -308,9 +362,32 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
             )
 
         attempt = 1
+        content_attempts = 0
         while True:
             try:
                 response = handler(request)
+
+                # MiMo content rejection check — retry once on high-risk text response.
+                if self._is_mimo_content_rejection(response, request):
+                    content_attempts += 1
+                    if content_attempts < _MIMO_CONTENT_MAX_ATTEMPTS:
+                        logger.warning(
+                            "MiMo high-risk content rejection on attempt %d/%d; retrying in %.0fms",
+                            content_attempts,
+                            _MIMO_CONTENT_MAX_ATTEMPTS,
+                            _MIMO_CONTENT_RETRY_SLEEP_SEC * 1000,
+                        )
+                        self._emit_retry_event(
+                            content_attempts,
+                            int(_MIMO_CONTENT_RETRY_SLEEP_SEC * 1000),
+                            "content_rejection",
+                            max_attempts=_MIMO_CONTENT_MAX_ATTEMPTS,
+                        )
+                        time.sleep(_MIMO_CONTENT_RETRY_SLEEP_SEC)
+                        continue
+                    # Exhausted content retries — return the rejection response as-is.
+                    return response
+
                 self._record_success()
                 return response
             except GraphBubbleUp:
@@ -360,9 +437,32 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
             )
 
         attempt = 1
+        content_attempts = 0
         while True:
             try:
                 response = await handler(request)
+
+                # MiMo content rejection check — retry once on high-risk text response.
+                if self._is_mimo_content_rejection(response, request):
+                    content_attempts += 1
+                    if content_attempts < _MIMO_CONTENT_MAX_ATTEMPTS:
+                        logger.warning(
+                            "MiMo high-risk content rejection on attempt %d/%d; retrying in %.0fms",
+                            content_attempts,
+                            _MIMO_CONTENT_MAX_ATTEMPTS,
+                            _MIMO_CONTENT_RETRY_SLEEP_SEC * 1000,
+                        )
+                        self._emit_retry_event(
+                            content_attempts,
+                            int(_MIMO_CONTENT_RETRY_SLEEP_SEC * 1000),
+                            "content_rejection",
+                            max_attempts=_MIMO_CONTENT_MAX_ATTEMPTS,
+                        )
+                        await asyncio.sleep(_MIMO_CONTENT_RETRY_SLEEP_SEC)
+                        continue
+                    # Exhausted content retries — return the rejection response as-is.
+                    return response
+
                 self._record_success()
                 return response
             except GraphBubbleUp:
