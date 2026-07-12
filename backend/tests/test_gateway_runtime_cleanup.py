@@ -43,6 +43,16 @@ def test_service_launchers_always_use_gateway_runtime():
         assert "LANGGRAPH_REWRITE" not in content, path
 
 
+def test_docker_dev_mounts_mutable_configs_through_project_directory():
+    compose = _read("docker/docker-compose-dev.yaml")
+
+    assert re.search(r"^\s*-\s*\.\./:/app/project(?:\:\S+)?\s*$", compose, re.M)
+    assert not re.search(r"^\s*-\s*[^\n#]*config\.yaml\s*:\s*[^\n#]*$", compose, re.M)
+    assert not re.search(r"^\s*-\s*[^\n#]*extensions_config\.json\s*:\s*[^\n#]*$", compose, re.M)
+    assert "DEER_FLOW_CONFIG_PATH=/app/project/config.yaml" in compose
+    assert "DEER_FLOW_EXTENSIONS_CONFIG_PATH=/app/project/extensions_config.json" in compose
+
+
 def test_local_dev_gateway_reload_excludes_runtime_state_with_absolute_dirs():
     serve_sh = _read("scripts/serve.sh")
 
@@ -147,3 +157,14 @@ def test_gateway_runtime_docs_do_not_reference_transition_modes():
         assert "./scripts/deploy.sh --gateway" not in content, path
         assert "docker compose --profile gateway" not in content, path
         assert "`/api/langgraph/*` → LangGraph" not in content, path
+
+
+def test_agent_instruction_docs_do_not_reference_standalone_langgraph_server():
+    """Agent/Copilot instruction docs must describe only the Gateway-embedded
+    runtime — no standalone LangGraph service, port 2024, or langgraph.log."""
+    content = _read(".github/copilot-instructions.md")
+
+    assert "langgraph.log" not in content
+    assert "localhost:2024" not in content
+    assert "127.0.0.1:2024" not in content
+    assert "Starts LangGraph" not in content

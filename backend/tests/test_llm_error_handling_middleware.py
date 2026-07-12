@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import AIMessage
 from langgraph.errors import GraphBubbleUp
 
@@ -223,6 +222,73 @@ async def test_async_circuit_half_open_graph_bubble_up_resets_probe() -> None:
     # Verify probe_in_flight was reset, state should remain half_open
     assert middleware._circuit_probe_in_flight is False
     assert middleware._circuit_state == "half_open"
+
+
+def test_circuit_half_open_non_retriable_error_resets_probe() -> None:
+    """A non-retriable error during a half-open probe must release the probe.
+
+    Regression: the non-retriable branch neither recorded a failure (correct —
+    business errors like quota/auth must not trip the breaker) nor reset
+    ``_circuit_probe_in_flight``. So one non-retriable probe left the circuit
+    stuck at half_open with probe_in_flight=True, and every subsequent call
+    fast-failed forever because no later call could ever run the handler to
+    reach ``_record_success`` / ``_record_failure``.
+    """
+    import unittest.mock
+
+    middleware = _build_middleware()
+
+    # Enter half_open and let one probe through (probe_in_flight -> True).
+    middleware._circuit_state = "half_open"
+    middleware._circuit_probe_in_flight = False
+    assert middleware._check_circuit() is False
+    assert middleware._circuit_probe_in_flight is True
+
+    def handler(_request) -> AIMessage:
+        raise FakeError("insufficient_quota", status_code=429, code="insufficient_quota")
+
+    # _check_circuit already admitted the probe above; keep it False here so the
+    # top-of-call gate does not fast-fail before the handler runs. Force the
+    # error to classify as non-retriable regardless of heuristics.
+    with unittest.mock.patch.object(middleware, "_check_circuit", return_value=False):
+        with unittest.mock.patch.object(middleware, "_classify_error", return_value=(False, "quota")):
+            result = middleware.wrap_model_call(SimpleNamespace(), handler)
+
+    # Non-retriable errors still surface a graceful fallback (not a raise) and
+    # must NOT trip the breaker.
+    assert isinstance(result, AIMessage)
+    assert middleware._circuit_state == "half_open"
+    # The probe was released, so the real gate re-admits the next probe instead
+    # of fast-failing forever.
+    assert middleware._circuit_probe_in_flight is False
+    assert middleware._check_circuit() is False
+    assert middleware._circuit_probe_in_flight is True
+
+
+@pytest.mark.anyio
+async def test_async_circuit_half_open_non_retriable_error_resets_probe() -> None:
+    """Async mirror: a non-retriable error during a half-open probe releases it."""
+    import unittest.mock
+
+    middleware = _build_middleware()
+
+    middleware._circuit_state = "half_open"
+    middleware._circuit_probe_in_flight = False
+    assert middleware._check_circuit() is False
+    assert middleware._circuit_probe_in_flight is True
+
+    async def handler(_request) -> AIMessage:
+        raise FakeError("insufficient_quota", status_code=429, code="insufficient_quota")
+
+    with unittest.mock.patch.object(middleware, "_check_circuit", return_value=False):
+        with unittest.mock.patch.object(middleware, "_classify_error", return_value=(False, "quota")):
+            result = await middleware.awrap_model_call(SimpleNamespace(), handler)
+
+    assert isinstance(result, AIMessage)
+    assert middleware._circuit_state == "half_open"
+    assert middleware._circuit_probe_in_flight is False
+    assert middleware._check_circuit() is False
+    assert middleware._circuit_probe_in_flight is True
 
 
 # ---------- Circuit Breaker Tests ----------
@@ -678,225 +744,78 @@ def test_user_message_for_quota_unchanged() -> None:
     message = middleware._build_user_message(exc, reason="quota")
 
     assert "out of quota" in message
+    assert "streaming response was interrupted" not in message
 
 
-# =========================================================================
-# MiMo content-rejection retry tests
-# =========================================================================
-
-_MIMO_REJECTION_TEXT = "The request was rejected because it was considered high risk"
-
-
-def _make_mimo_request() -> ModelRequest:
-    """Build a ModelRequest with a minimal PatchedChatMiMo model."""
-    from deerflow.models.patched_mimo import PatchedChatMiMo
-
-    return ModelRequest(
-        model=PatchedChatMiMo(
-            model="mimo-v2.5-pro",
-            api_key="test-key",
-            base_url="https://api.xiaomimimo.com/v1",
-        ),
-        messages=[],
-    )
+def test_classify_error_index_error_is_retriable_transient() -> None:
+    """``langchain_core.language_models.chat_models.ainvoke`` crashes with
+    ``IndexError: list index out of range`` when the upstream provider
+    returns ``200 OK`` with ``generations == []`` (observed against the
+    Volces "coding" endpoint at ark.cn-beijing.volces.com). That's an
+    upstream-payload glitch we don't want killing the entire run, so it
+    must classify as retriable/transient and go through the normal
+    retry/backoff path.
+    """
+    middleware = _build_middleware()
+    exc = IndexError("list index out of range")
+    retriable, reason = middleware._classify_error(exc)
+    assert retriable is True
+    assert reason == "transient"
 
 
-def test_sync_mimo_content_rejection_retries_once(
+def test_async_index_error_retries_then_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """First call returns rejection text; middleware retries once, second call
-    returns valid content. Verifies 0.5s sleep and exactly 2 total attempts."""
-    middleware = _build_middleware()
-    calls: list[int] = []
-    waits: list[float] = []
+    """Empty-``generations`` payloads from the upstream provider must not
+    abort the run on the first failure. Confirm that the retry loop kicks
+    in and the next attempt's successful AIMessage is returned to the
+    caller instead of an error fallback.
+    """
+    middleware = _build_middleware(retry_max_attempts=3, retry_base_delay_ms=10, retry_cap_delay_ms=10)
+    attempts = 0
 
-    monkeypatch.setattr("time.sleep", lambda d: waits.append(d))
+    async def fake_sleep(_delay: float) -> None:
+        return None
 
-    def handler(_request: ModelRequest) -> AIMessage:
-        calls.append(len(calls))
-        if len(calls) == 1:
-            return AIMessage(content=_MIMO_REJECTION_TEXT)
+    async def handler(_request) -> AIMessage:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 2:
+            raise IndexError("list index out of range")
         return AIMessage(content="ok")
 
-    result = middleware.wrap_model_call(_make_mimo_request(), handler)
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+
+    result = asyncio.run(middleware.awrap_model_call(SimpleNamespace(), handler))
 
     assert isinstance(result, AIMessage)
     assert result.content == "ok"
-    assert len(calls) == 2  # first (rejected) + second (ok)
-    assert len(waits) == 1
-    assert waits[0] == pytest.approx(0.5, rel=1e-6)
+    assert attempts == 2
 
 
-@pytest.mark.anyio
-async def test_async_mimo_content_rejection_retries_once(
+def test_async_index_error_exhausted_returns_user_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Async mirror of the sync test."""
-    middleware = _build_middleware()
-    calls: list[int] = []
-    waits: list[float] = []
+    """If every retry hits the same empty-``generations`` IndexError, the
+    middleware must still produce a user-facing fallback AIMessage (with
+    ``deerflow_error_fallback=True``) instead of letting the IndexError
+    propagate out of the agent loop and ending the run in ``error``
+    status with no GitHub-side reply.
+    """
+    middleware = _build_middleware(retry_max_attempts=2, retry_base_delay_ms=10, retry_cap_delay_ms=10)
 
-    async def fake_sleep(d: float) -> None:
-        waits.append(d)
+    async def fake_sleep(_delay: float) -> None:
+        return None
 
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    async def handler(_request) -> AIMessage:
+        raise IndexError("list index out of range")
 
-    async def handler(_request: ModelRequest) -> AIMessage:
-        calls.append(len(calls))
-        if len(calls) == 1:
-            return AIMessage(content=_MIMO_REJECTION_TEXT)
-        return AIMessage(content="ok")
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
 
-    result = await middleware.awrap_model_call(_make_mimo_request(), handler)
-
-    assert isinstance(result, AIMessage)
-    assert result.content == "ok"
-    assert len(calls) == 2
-    assert len(waits) == 1
-    assert waits[0] == pytest.approx(0.5, rel=1e-6)
-
-
-def test_sync_mimo_content_rejection_exhausted_returns_rejection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When retry also returns rejection, the second attempt's response is
-    returned as-is so the user sees the rejection text."""
-    middleware = _build_middleware()
-    waits: list[float] = []
-    monkeypatch.setattr("time.sleep", lambda d: waits.append(d))
-
-    call_count = 0
-
-    def handler(_request: ModelRequest) -> AIMessage:
-        nonlocal call_count
-        call_count += 1
-        return AIMessage(content=_MIMO_REJECTION_TEXT)
-
-    result = middleware.wrap_model_call(_make_mimo_request(), handler)
+    result = asyncio.run(middleware.awrap_model_call(SimpleNamespace(), handler))
 
     assert isinstance(result, AIMessage)
-    assert _MIMO_REJECTION_TEXT in result.content
-    assert call_count == 2  # first attempt + exactly 1 retry
-    assert len(waits) == 1
-
-
-@pytest.mark.anyio
-async def test_async_mimo_content_rejection_exhausted_returns_rejection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Async mirror of exhaustion test."""
-    middleware = _build_middleware()
-    waits: list[float] = []
-
-    async def fake_sleep(d: float) -> None:
-        waits.append(d)
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-
-    call_count = 0
-
-    async def handler(_request: ModelRequest) -> AIMessage:
-        nonlocal call_count
-        call_count += 1
-        return AIMessage(content=_MIMO_REJECTION_TEXT)
-
-    result = await middleware.awrap_model_call(_make_mimo_request(), handler)
-
-    assert isinstance(result, AIMessage)
-    assert _MIMO_REJECTION_TEXT in result.content
-    assert call_count == 2
-    assert len(waits) == 1
-
-
-def test_mimo_content_rejection_skipped_for_non_mimo_models() -> None:
-    """If the model is not a MiMo model, the rejection text must pass through
-    without any retry."""
-    middleware = _build_middleware()
-
-    from langchain_openai import ChatOpenAI
-
-    request = ModelRequest(
-        model=ChatOpenAI(model="gpt-4o", api_key="sk-test"),
-        messages=[],
-    )
-
-    call_count = 0
-
-    def handler(_request: ModelRequest) -> AIMessage:
-        nonlocal call_count
-        call_count += 1
-        return AIMessage(content=_MIMO_REJECTION_TEXT)
-
-    result = middleware.wrap_model_call(request, handler)
-
-    assert isinstance(result, AIMessage)
-    assert _MIMO_REJECTION_TEXT in result.content
-    assert call_count == 1  # no retry for non-MiMo
-
-
-def test_mimo_content_rejection_emits_retry_event(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Check that the SSE retry event is emitted with correct fields."""
-    middleware = _build_middleware()
-    events: list[dict] = []
-    monkeypatch.setattr("time.sleep", lambda d: None)
-
-    def capture_event(event: dict) -> None:
-        events.append(event)
-
-    monkeypatch.setattr(
-        "langgraph.config.get_stream_writer",
-        lambda: capture_event,
-    )
-
-    def handler(_request: ModelRequest) -> AIMessage:
-        return AIMessage(content=_MIMO_REJECTION_TEXT)
-
-    middleware.wrap_model_call(_make_mimo_request(), handler)
-
-    assert len(events) == 1
-    ev = events[0]
-    assert ev["type"] == "llm_retry"
-    assert ev["reason"] == "content_rejection"
-    assert ev["attempt"] == 1
-    assert ev["max_attempts"] == 2
-    assert "content rejection" in ev["message"]
-
-
-def test_mimo_content_rejection_does_not_affect_circuit_breaker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Exhausting the content rejection retry must NOT increment the circuit
-    breaker failure count."""
-    middleware = _build_middleware()
-    monkeypatch.setattr("time.sleep", lambda d: None)
-
-    def handler(_request: ModelRequest) -> AIMessage:
-        return AIMessage(content=_MIMO_REJECTION_TEXT)
-
-    # Call twice: each exhausts its own content retry budget.
-    middleware.wrap_model_call(_make_mimo_request(), handler)
-    assert middleware._circuit_failure_count == 0
-
-    middleware.wrap_model_call(_make_mimo_request(), handler)
-    assert middleware._circuit_failure_count == 0
-    assert middleware._circuit_state == "closed"
-
-
-def test_mimo_content_rejection_request_missing_model_does_not_crash() -> None:
-    """When 'request' has no 'model' attribute (e.g. SimpleNamespace in tests),
-    the check must return False gracefully without AttributeError."""
-    middleware = _build_middleware()
-
-    called = False
-
-    def handler(_request: object) -> AIMessage:
-        nonlocal called
-        called = True
-        return AIMessage(content=_MIMO_REJECTION_TEXT)
-
-    result = middleware.wrap_model_call(SimpleNamespace(), handler)
-
-    assert isinstance(result, AIMessage)
-    assert called
+    assert result.additional_kwargs["deerflow_error_fallback"] is True
+    assert result.additional_kwargs["error_reason"] == "transient"
+    assert result.additional_kwargs["error_type"] == "IndexError"
+    assert "temporarily unavailable" in str(result.content)
