@@ -89,6 +89,10 @@ async def scan_skill_content(
     static_findings: list[dict[str, Any]] | None = None,
 ) -> ScanResult:
     """Screen skill content before it is written to disk."""
+    config = app_config or get_app_config()
+    if not getattr(config.skill_evolution, "security_scan", True):
+        return ScanResult("allow", "Security scan disabled by configuration")
+
     rubric = (
         "You are a security reviewer for AI agent skills. "
         "Classify the content as allow, warn, or block. "

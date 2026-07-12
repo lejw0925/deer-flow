@@ -226,7 +226,7 @@ def merge_skill_context(existing: list[SkillEntry] | None, new: list[SkillEntry]
 
 class ThreadState(AgentState):
     sandbox: SandboxStateField
-    thread_data: NotRequired[ThreadDataState | None]
+    thread_data: Annotated[ThreadDataState | None, lambda x, y: y if y is not None else x]
     title: NotRequired[str | None]
     artifacts: Annotated[list[str], merge_artifacts]
     todos: Annotated[list | None, merge_todos]
