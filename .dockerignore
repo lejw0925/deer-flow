@@ -62,6 +62,7 @@ docker/
 skills/
 frontend/.next
 frontend/node_modules
+backend/.deer-flow
 backend/.venv
 backend/htmlcov
 backend/.coverage
