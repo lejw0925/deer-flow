@@ -23,6 +23,7 @@ from deerflow.sandbox.exceptions import (
     SandboxRuntimeError,
 )
 from deerflow.sandbox.file_operation_lock import get_file_operation_lock
+from deerflow.sandbox.path_patterns import build_output_mask_pattern
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import get_sandbox_provider
 from deerflow.sandbox.search import GrepMatch
@@ -727,20 +728,16 @@ def _compiled_mask_patterns(sources: tuple[tuple[str, str], ...]) -> tuple[tuple
     glob/grep match, so without this the same patterns are recompiled per
     match.
     """
-    # Same segment-boundary lookahead as ``LocalSandbox._reverse_output_patterns``
-    # (#4035), so a host base does not match inside a sibling that merely shares
-    # its prefix (``.../skills`` inside ``.../skills-extra``). Without it the
-    # regex yields the bare base, which then *equals* ``base`` in
-    # ``replace_match`` and so the sibling is rewritten to a container path that
-    # forward resolution refuses to map back.
+    # The segment boundary and path tail are shared with
+    # ``LocalSandbox._reverse_output_patterns`` — see
+    # ``deerflow.sandbox.path_patterns``, which owns that rule so the two copies
+    # cannot drift again (#4035 fixed one and missed the other; #4053 fixed the
+    # other).
     #
-    # The class mirrors ``_content_pattern``'s: this runs over arbitrary command
-    # output, where a base can legitimately be followed by ``,`` ``:`` or ``\``.
-    # ``$`` is load-bearing — output ending exactly at a base would otherwise
-    # fail the lookahead and be emitted as the raw host path.
-    boundary = r"(?=/|$|[^\w./-])"
-    tail = r"(?:[/\\][^\s\"';&|<>()]*)?"
-
+    # ``separator_agnostic=True`` is the one thing this site does differently:
+    # its bases come from ``_path_variants``, which yields Windows-style
+    # spellings, and they are matched against output whose separators this layer
+    # does not control.
     compiled: list[tuple[re.Pattern[str], str, str]] = []
     for host_base, virtual_base in sources:
         seen: set[str] = set()
@@ -753,8 +750,7 @@ def _compiled_mask_patterns(sources: tuple[tuple[str, str], ...]) -> tuple[tuple
                 if variant in seen:
                     continue
                 seen.add(variant)
-                escaped = re.escape(variant).replace(r"\\", r"[/\\]")
-                compiled.append((re.compile(escaped + boundary + tail), variant, virtual_base))
+                compiled.append((build_output_mask_pattern(variant, separator_agnostic=True), variant, virtual_base))
     return tuple(compiled)
 
 
@@ -1244,7 +1240,21 @@ def replace_virtual_paths_in_command(command: str, thread_data: ThreadDataState 
 
     # Replace user-data paths
     if VIRTUAL_PATH_PREFIX in result and thread_data is not None:
-        pattern = re.compile(rf"{re.escape(VIRTUAL_PATH_PREFIX)}(/[^\s\"';&|<>()]*)?")
+        # The segment-boundary lookahead is what keeps the virtual root from
+        # matching inside a sibling that merely shares its prefix
+        # (``/mnt/user-data`` inside ``/mnt/user-data-backup``). The trailing
+        # group needs a ``/`` to consume anything, so without the lookahead the
+        # bare root still matches and the sibling is rewritten into the thread's
+        # host directory — a real path outside the mount contract. Same defect as
+        # #4035 (reverse patterns) and #4053 (masking patterns), mirrored into
+        # this direction.
+        #
+        # The class mirrors ``LocalSandbox._content_pattern``'s rather than
+        # ``_command_pattern``'s: a virtual root can legitimately be followed by
+        # ``:`` (PATH-style concatenation) or ``,``, which the shell-oriented
+        # class rejects — narrowing to it would stop translating paths that
+        # translate today. ``$`` covers a command ending exactly at the root.
+        pattern = re.compile(rf"{re.escape(VIRTUAL_PATH_PREFIX)}(?=/|$|[^\w./-])(/[^\s\"';&|<>()]*)?")
 
         def replace_user_data_match(match: re.Match) -> str:
             return replace_virtual_path(match.group(0), thread_data).replace("\\", "/")
@@ -1600,9 +1610,10 @@ CHANNEL_USER_ID_ENV = "DEERFLOW_CHANNEL_USER_ID"
 
 _CHANNEL_USER_ID_CONTEXT_KEY = "channel_user_id"
 
-# body.context is client-writable on web requests, so bound the value: real
-# platform ids are tens of chars; anything past this is hostile or corrupt and
-# must not bloat every command string sent to the sandbox.
+# Gateway accepts this identity only from internally authenticated channel
+# requests, but embedded runtimes can still construct context directly. Bound
+# the value defensively: real platform ids are tens of chars; anything past
+# this is corrupt and must not bloat every sandbox command string.
 _CHANNEL_USER_ID_MAX_LEN = 256
 
 
@@ -1741,6 +1752,7 @@ def bash_tool(runtime: Runtime, description: str, command: str) -> str:
                 max_chars,
             )
         ensure_thread_directories_exist(runtime)
+        command = f"cd {VIRTUAL_PATH_PREFIX}/workspace; {command}"
         if identity_prefix:
             command = identity_prefix + command
         try:
@@ -2267,9 +2279,11 @@ def str_replace_tool(
             # Custom mount paths are resolved by LocalSandbox._resolve_path()
         with get_file_operation_lock(sandbox, path):
             content = sandbox.read_file(path)
-            if not content:
+            if not old_str:
+                # A no-op edit. str.replace("", new_str) would insert new_str at
+                # every character boundary, so this cannot fall through.
                 return "OK"
-            if old_str not in content:
+            if not content or old_str not in content:
                 return f"Error: String to replace not found in file: {requested_path}"
             if replace_all:
                 content = content.replace(old_str, new_str)

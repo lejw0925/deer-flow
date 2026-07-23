@@ -12,7 +12,7 @@ class SkillEvolutionConfig(BaseModel):
         default=None,
         description="Optional model name for skill security moderation. Defaults to the primary chat model.",
     )
-    security_scan: bool = Field(
+    security_fail_closed: bool = Field(
         default=True,
-        description="Whether to run LLM-based security scanning on agent-managed skill writes. Set to false to bypass.",
+        description=("When the moderation model is unavailable, block skill writes if True (fail-closed). If False, non-executable content is allowed with a warning while executable content is still blocked."),
     )
