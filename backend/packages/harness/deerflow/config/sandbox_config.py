@@ -76,8 +76,9 @@ class SandboxConfig(BaseModel):
 
     AioSandboxProvider, BoxliteProvider, and E2BSandboxProvider shared options:
         image: Sandbox image to use (Docker/AIO image or BoxLite OCI image)
-        replicas: Positive provider capacity per gateway process. Each provider
-            defines which lifecycle states count toward this limit.
+        replicas: Positive provider capacity. E2B shares it across Gateway
+            workers when ownership uses Redis; other modes/providers keep
+            process-local accounting.
         idle_timeout: Idle timeout in seconds before released warm sandboxes/VMs are stopped (default: 600 = 10 minutes). Set to 0 to disable.
         environment: Environment variables to inject into the sandbox (values starting with $ are resolved from host env)
 
@@ -88,8 +89,12 @@ class SandboxConfig(BaseModel):
         port: Base port for sandbox containers (default: 8080)
         container_prefix: Prefix for container names (default: deer-flow-sandbox)
         mounts: List of volume mounts to share directories with the container
-        ownership: Cross-instance container ownership store (memory | redis). Multi-instance
-            deployments sharing a container backend need redis; see SandboxOwnershipConfig.
+        thread_data_mounts: Override whether thread data is already visible to
+            the sandbox through shared mounts. Omit to auto-detect from the backend.
+
+    AioSandboxProvider and E2BSandboxProvider shared options:
+        ownership: Cross-instance sandbox ownership store (memory | redis). Multi-instance
+            deployments sharing a sandbox backend need redis; see SandboxOwnershipConfig.
     """
 
     use: str = Field(
@@ -111,7 +116,7 @@ class SandboxConfig(BaseModel):
     replicas: int | None = Field(
         default=None,
         gt=0,
-        description="Positive provider capacity per gateway process. Each provider defines which lifecycle states count toward this limit.",
+        description=("Positive provider capacity. E2B enforces it deployment-wide when sandbox ownership uses Redis; otherwise accounting is per Gateway process. Each provider defines which lifecycle states count."),
     )
     overflow_policy: SandboxOverflowPolicy = Field(
         default="wait",
@@ -143,13 +148,17 @@ class SandboxConfig(BaseModel):
     ownership: SandboxOwnershipConfig | None = Field(
         default=None,
         description=(
-            "AioSandboxProvider-only: where cross-instance container ownership is tracked (#4206). Omitted = memory (single-instance). "
-            "Multi-worker / load-balanced gateways sharing one container backend must set type: redis, or peers will adopt and idle-destroy each other's live sandboxes."
+            "AioSandboxProvider/E2BSandboxProvider: where cross-instance sandbox ownership is tracked (#4206, #4341). Omitted = memory (single-instance). "
+            "Multi-worker / load-balanced gateways sharing one sandbox backend must set type: redis, or peers can adopt and destroy each other's live sandboxes."
         ),
     )
     mounts: list[VolumeMountConfig] = Field(
         default_factory=list,
         description="List of volume mounts to share directories between host and container",
+    )
+    thread_data_mounts: bool | None = Field(
+        default=None,
+        description=("AioSandboxProvider: override whether /mnt/user-data is already visible through shared mounts. Omitted uses backend auto-detection; true skips explicit upload synchronization; false forces it."),
     )
     environment: dict[str, str] = Field(
         default_factory=dict,

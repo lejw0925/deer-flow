@@ -51,7 +51,12 @@ export const zhCN: Translations = {
     exportAsMarkdown: "导出为 Markdown",
     exportAsJSON: "导出为 JSON",
     exportSuccess: "对话已导出",
+    exportFailed: "导出对话失败。",
     regenerate: "重新生成",
+    editAndRerun: "编辑并重新运行",
+    updateAndRerun: "更新并重新运行",
+    editRerunWarning:
+      "重新运行只恢复对话状态，不会撤销文件、Memory 或外部操作。",
     branch: "分叉",
     showArtifacts: "查看此对话的文件",
     browser: "浏览器",
@@ -93,6 +98,29 @@ export const zhCN: Translations = {
     copiedToClipboard: "已复制到剪贴板",
     failedToCopyToClipboard: "复制到剪贴板失败",
     linkCopied: "链接已复制到剪贴板",
+  },
+
+  artifactEditing: {
+    unsaved: "未保存",
+    saving: "正在保存...",
+    saved: "文件已保存",
+    exit: "退出编辑",
+    discard: "放弃修改",
+    discardChanges: "要放弃对此文件的未保存修改吗？",
+    conflict: "开始编辑后文件已发生变化。请放弃草稿并重新加载后再保存。",
+    conflictShort: "远端已更新",
+    runInProgress: "请等待当前 Agent 运行结束后再保存。",
+    saveFailed: "保存文件失败",
+  },
+
+  artifactPreview: {
+    limited: (previewSize, totalSize) =>
+      totalSize
+        ? `当前显示 ${totalSize} 中的前 ${previewSize}。`
+        : `当前显示前 ${previewSize}。`,
+    loadFullFile: "加载完整文件",
+    loadingFullFile: "正在加载完整文件...",
+    previewFailed: "无法预览此文件，但仍可下载原始文件。",
   },
 
   // Citations
@@ -483,6 +511,7 @@ export const zhCN: Translations = {
     startConversation: "开始新的对话以查看消息",
     branchCreated: "已创建分叉对话",
     branchFailed: "创建分叉对话失败。",
+    streamReplayGap: "部分实时更新已过期，已从持久化状态恢复对话。",
   },
 
   // Chats
@@ -491,6 +520,9 @@ export const zhCN: Translations = {
     loadMoreToSearch: "加载更多以搜索更早的对话",
     loadingMore: "正在加载...",
     loadOlderChats: "加载更早的对话",
+    pinChat: "置顶对话",
+    unpinChat: "取消置顶",
+    pinChatFailed: "更新对话置顶状态失败",
   },
 
   // Sidecar
@@ -542,6 +574,7 @@ export const zhCN: Translations = {
     saveAndConnect: "保存并连接",
     saveChanges: "保存修改",
     descriptions: {
+      buzz: "通过 DeerFlow 智能体接收 Buzz 频道消息和私聊。",
       telegram: "通过 DeerFlow Bot 接收 Telegram 私聊消息。",
       slack: "接收 Slack 工作区消息和提及。",
       discord: "通过 DeerFlow Bot 接收 Discord 服务器消息。",
@@ -600,6 +633,9 @@ export const zhCN: Translations = {
     otherPlaceholder: "输入其他回答...",
     submit: "提交",
     emptyError: "请输入回答后再提交。",
+    requiredError: "请填写所有必填字段后再提交。",
+    requiredA11yLabel: "必填",
+    selectPlaceholder: "请选择...",
     answeredValue: (value: string) => `已回答：${value}`,
   },
 
@@ -658,6 +694,12 @@ export const zhCN: Translations = {
     completeTodo: (content: string) => `完成 To-do：${content}`,
     updateTodo: (content: string) => `更新 To-do：${content}`,
     removeTodo: (content: string) => `移除 To-do：${content}`,
+  },
+
+  contextUsage: {
+    label: "上下文",
+    title: "上下文窗口",
+    badgeAriaLabel: (percentage: string) => `上下文窗口已使用 ${percentage}%`,
   },
 
   // Shortcuts
@@ -810,6 +852,7 @@ export const zhCN: Translations = {
         auth: "授权",
         sandboxRuntime: "沙箱运行时",
         sandboxRuntimeInitContainer: "由 init container 提供",
+        sandboxRuntimeBroker: "由 broker sidecar 提供",
         sandboxRuntimeGatewayDownload: "由 Gateway 提供",
         sandboxRuntimeNotReady: "未就绪 —— 对话时 lark-cli 可能不可用",
         notInstalled: "尚未安装",
@@ -830,6 +873,19 @@ export const zhCN: Translations = {
         requestPermissions: "申请新权限",
         alreadyConnected:
           "飞书已连接，无需重复授权。如果授权已过期，刷新状态后可重新连接。",
+        changeAppButton: "切换飞书 Bot",
+        changeAppTitle: "切换到其他飞书 App",
+        changeAppDescription:
+          "把你的 DeerFlow 账号指向另一个 Lark/飞书 App。只影响你自己的账号，不影响其他用户。",
+        changeAppIdLabel: "App ID",
+        changeAppSecretLabel: "App Secret",
+        changeAppAuthResetNote:
+          "切换时会撤销旧 App 的授权，随后需要授权新 App。",
+        changeAppSubmit: "切换 App",
+        changeAppReRegister: "在浏览器重新注册",
+        changeAppSwitched: "已切换飞书 App。请重新连接以授权新 App。",
+        brandFeishu: "飞书",
+        brandLark: "Lark",
         connectionStarted: "连接链接已打开",
         connectionReady: "连接准备已完成，正在打开授权链接",
         authStarted: "授权页已打开，DeerFlow 会自动检测授权结果。",

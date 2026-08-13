@@ -10,6 +10,7 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -17,6 +18,10 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from deerflow.community.e2b_sandbox.capacity import (
+    CapacityBackendError,
+    ReserveStatus,
+)
 from deerflow.config.paths import Paths
 from deerflow.config.sandbox_config import SandboxConfig
 from deerflow.sandbox.exceptions import SandboxCapacityExceededError
@@ -175,6 +180,65 @@ class FakeSandboxClass:
         return self.list_return
 
 
+class FakeOwnershipStore:
+    """Shared lease state with per-provider identities for reconciliation tests."""
+
+    supports_cross_process = True
+
+    def __init__(
+        self,
+        leases: dict[str, tuple[str, str]],
+        *,
+        owner_id: str,
+        lock: threading.Lock | None = None,
+    ) -> None:
+        self._leases = leases
+        self._lock = lock or threading.Lock()
+        self.owner_id = owner_id
+
+    def take(self, sandbox_id: str) -> bool:
+        with self._lock:
+            current = self._leases.get(sandbox_id)
+            if current is not None and current[1] == "del":
+                return False
+            self._leases[sandbox_id] = (self.owner_id, "own")
+            return True
+
+    def claim(self, sandbox_id: str, *, for_destroy: bool = False) -> bool:
+        with self._lock:
+            current = self._leases.get(sandbox_id)
+            if current is not None and current[0] != self.owner_id:
+                return False
+            if current is not None and current[1] == "del" and not for_destroy:
+                return False
+            self._leases[sandbox_id] = (self.owner_id, "del" if for_destroy else "own")
+            return True
+
+    def renew(self, sandbox_id: str):
+        from deerflow.community.aio_sandbox.ownership import RenewOutcome
+
+        with self._lock:
+            current = self._leases.get(sandbox_id)
+            if current is None:
+                return RenewOutcome.LAPSED
+            if current == (self.owner_id, "own"):
+                return RenewOutcome.RENEWED
+            return RenewOutcome.LOST
+
+    def release(self, sandbox_id: str) -> None:
+        with self._lock:
+            if self._leases.get(sandbox_id, (None,))[0] == self.owner_id:
+                self._leases.pop(sandbox_id, None)
+
+    def owner(self, sandbox_id: str) -> str | None:
+        with self._lock:
+            current = self._leases.get(sandbox_id)
+            return current[0] if current is not None else None
+
+    def close(self) -> None:
+        return None
+
+
 def _make_provider(*, replicas: int = 3, idle_timeout: int = 1800, overflow_policy: str = "wait", acquire_timeout: int = 30, burst_limit: int = 0) -> Any:
     """Build a ``E2BSandboxProvider`` instance bypassing ``__init__``."""
     mod = importlib.import_module("deerflow.community.e2b_sandbox.e2b_sandbox_provider")
@@ -192,6 +256,20 @@ def _make_provider(*, replicas: int = 3, idle_timeout: int = 1800, overflow_poli
     provider._transitioning_slots = 0
     provider._capacity_cond = threading.Condition(provider._lock)
     provider._shutdown_called = False
+    provider._owner_id = "owner-a"
+    provider._ownership = FakeOwnershipStore({}, owner_id=provider._owner_id)
+    provider._ownership_config = SimpleNamespace(
+        renewal_interval_seconds=60.0,
+        ttl_multiplier=4.0,
+        key_prefix="deerflow:test",
+    )
+    provider._deployment_capacity = None
+    provider._owned_sandbox_ids = set()
+    provider._acquire_inflight = set()
+    provider._orphan_first_seen = {}
+    provider._maintenance_stop = threading.Event()
+    provider._lease_thread = None
+    provider._reconcile_thread = None
     provider._config = {
         "api_key": "test-key",
         "template": "code-interpreter-v1",
@@ -204,14 +282,130 @@ def _make_provider(*, replicas: int = 3, idle_timeout: int = 1800, overflow_poli
         "burst_limit": burst_limit,
         "mounts": [],
         "environment": {},
+        "reconciliation_interval_seconds": 60.0,
+        "reconciliation_grace_seconds": 30.0,
+        "reconciliation_orphan_ttl_seconds": 3600.0,
+        "reconciliation_max_pages": 10,
+        "reconciliation_max_items": 100,
+        "reconciliation_max_seconds": 10.0,
     }
     return provider
+
+
+def _install_shared_deployment_capacity(
+    *providers,
+    reserve_results: list[ReserveStatus] | None = None,
+) -> MagicMock:
+    store = MagicMock()
+    store.key = "deerflow:test:e2b-capacity"
+    store.revision.return_value = 0
+    store.reserve.return_value = ReserveStatus.GRANTED
+    store.reconcile.return_value = True
+    if reserve_results is not None:
+        store.reserve.side_effect = reserve_results
+    for provider in providers:
+        provider._deployment_capacity = store
+    return store
 
 
 def _install_fake_sdk(monkeypatch, provider) -> FakeSandboxClass:
     fake_cls = FakeSandboxClass()
     monkeypatch.setattr(provider, "_get_sandbox_cls", lambda: fake_cls)
     return fake_cls
+
+
+def _write_skill(root: Path, name: str) -> None:
+    target = root / name / "SKILL.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"---\nname: {name}\ndescription: test\n---\n", encoding="utf-8")
+
+
+def test_apply_mounts_uploads_only_enabled_skill_projection(monkeypatch, tmp_path):
+    from deerflow.config.extensions_config import ExtensionsConfig, SkillStateConfig
+
+    mod = importlib.import_module("deerflow.community.e2b_sandbox.e2b_sandbox_provider")
+    paths = Paths(base_dir=tmp_path)
+    skills_root = tmp_path / "skills"
+    _write_skill(skills_root / "public", "enabled-skill")
+    _write_skill(skills_root / "public", "disabled-skill")
+    (skills_root / "custom").mkdir()
+    _write_skill(paths.integration_skills_dir() / "lark-cli", "enabled-integration")
+    _write_skill(paths.integration_skills_dir() / "lark-cli", "disabled-integration")
+    user_skills_root = paths.user_skills_dir("user-1")
+    user_skills_root.mkdir(parents=True, exist_ok=True)
+    (user_skills_root / "_skill_states.json").write_text(
+        json.dumps({"disabled-integration": {"enabled": False}}),
+        encoding="utf-8",
+    )
+    extensions = ExtensionsConfig(skills={"disabled-skill": SkillStateConfig(enabled=False)})
+    config = SimpleNamespace(
+        skills=SimpleNamespace(
+            get_skills_path=lambda: skills_root,
+            container_path="/mnt/skills",
+            use="deerflow.skills.storage.local_skill_storage:LocalSkillStorage",
+        )
+    )
+    monkeypatch.setattr(mod, "get_app_config", lambda: config)
+    monkeypatch.setattr("deerflow.config.paths.get_paths", lambda: paths)
+    monkeypatch.setattr("deerflow.config.extensions_config.ExtensionsConfig.from_file", lambda *_args, **_kwargs: extensions)
+    monkeypatch.setattr("deerflow.config.extensions_config.get_extensions_config", lambda: extensions)
+
+    provider = _make_provider()
+    client = FakeClient()
+    provider._apply_mounts(client, user_id="user-1")
+
+    uploaded_paths = {path for path, _content in client.files.write_calls}
+    assert "/mnt/skills/public/enabled-skill/SKILL.md" in uploaded_paths
+    assert "/mnt/skills/public/disabled-skill/SKILL.md" not in uploaded_paths
+    assert "/mnt/skills/integrations/lark-cli/enabled-integration/SKILL.md" in uploaded_paths
+    assert "/mnt/skills/integrations/lark-cli/disabled-integration/SKILL.md" not in uploaded_paths
+
+
+def test_skill_projection_mounts_swallows_projection_failure(monkeypatch):
+    """``_skill_projection_mounts`` must not raise — a projection failure used
+    to propagate out of ``_apply_mounts`` before the configured-mounts loop
+    ran, dropping the operator's own configured mounts as collateral (#4107
+    review)."""
+    mod = importlib.import_module("deerflow.community.e2b_sandbox.e2b_sandbox_provider")
+
+    config = SimpleNamespace(skills=SimpleNamespace(container_path="/mnt/skills"))
+    monkeypatch.setattr(mod, "get_app_config", lambda: config)
+    monkeypatch.setattr(
+        "deerflow.skills.projection.ensure_skill_projections",
+        lambda storage: (_ for _ in ()).throw(RuntimeError("simulated projection failure")),
+    )
+
+    provider = _make_provider()
+
+    assert provider._skill_projection_mounts("user-1") == []
+
+
+def test_apply_mounts_keeps_configured_mounts_when_projection_fails(monkeypatch, tmp_path):
+    """End-to-end: a skills-projection failure must not drop the operator's
+    own configured mounts too — the two mount sources are independent."""
+    mod = importlib.import_module("deerflow.community.e2b_sandbox.e2b_sandbox_provider")
+
+    host_dir = tmp_path / "operator-mount"
+    host_dir.mkdir()
+    (host_dir / "notes.txt").write_text("hello", encoding="utf-8")
+
+    config = SimpleNamespace(skills=SimpleNamespace(container_path="/mnt/skills"))
+    monkeypatch.setattr(mod, "get_app_config", lambda: config)
+    monkeypatch.setattr(
+        "deerflow.skills.projection.ensure_skill_projections",
+        lambda storage: (_ for _ in ()).throw(RuntimeError("simulated projection failure")),
+    )
+
+    provider = _make_provider()
+    provider._config["mounts"] = [
+        SimpleNamespace(host_path=str(host_dir), container_path="/mnt/operator", read_only=True),
+    ]
+
+    client = FakeClient()
+    provider._apply_mounts(client, user_id="user-1")
+
+    uploaded_paths = {path for path, _content in client.files.write_calls}
+    assert "/mnt/operator/notes.txt" in uploaded_paths
 
 
 def _make_sandbox(client: FakeClient, *, sandbox_id: str | None = None) -> Any:
@@ -412,6 +606,84 @@ def test_kill_and_close_swallows_kill_exceptions():
 
     client.kill = explode
     p._kill_and_close(sb)
+    assert "fake-sb-1" not in p._owned_sandbox_ids
+    assert p._ownership.owner("fake-sb-1") is None
+
+
+def test_kill_and_close_skips_peer_owned_sandbox():
+    p = _make_provider()
+    client = FakeClient(sandbox_id="peer-owned")
+    sandbox = _make_sandbox(client, sandbox_id="peer-owned")
+    p._ownership = FakeOwnershipStore(
+        {"peer-owned": ("owner-peer", "own")},
+        owner_id=p._owner_id,
+    )
+
+    p._kill_and_close(sandbox)
+
+    assert client.killed is False
+    assert client.closed is True
+    assert p._ownership.owner("peer-owned") == "owner-peer"
+
+
+def test_startup_reconciliation_runs_in_background_without_blocking_caller(monkeypatch):
+    p = _make_provider()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def reconcile():
+        entered.set()
+        assert release.wait(timeout=2)
+
+    monkeypatch.setattr(p, "_reconcile_remote_sandboxes", reconcile)
+
+    started = time.monotonic()
+    p._start_maintenance_threads()
+    elapsed = time.monotonic() - started
+
+    assert entered.wait(timeout=1)
+    assert elapsed < 0.5
+
+    release.set()
+    p._maintenance_stop.set()
+    for thread in (p._lease_thread, p._reconcile_thread):
+        assert thread is not None
+        thread.join(timeout=2)
+
+
+def test_refresh_owned_leases_reclaims_lapsed_lease():
+    p = _make_provider()
+    client = FakeClient(sandbox_id="sb-lapsed")
+    sandbox = _make_sandbox(client, sandbox_id="sb-lapsed")
+    p._sandboxes["sb-lapsed"] = sandbox
+    p._thread_sandboxes[("u1", "t1")] = "sb-lapsed"
+    p._owned_sandbox_ids.add("sb-lapsed")
+
+    p._refresh_owned_leases()
+
+    assert p._ownership.owner("sb-lapsed") == p._owner_id
+    assert p.get("sb-lapsed") is sandbox
+    assert client.closed is False
+
+
+def test_refresh_owned_leases_forgets_peer_owned_sandbox():
+    p = _make_provider()
+    client = FakeClient(sandbox_id="sb-lost")
+    sandbox = _make_sandbox(client, sandbox_id="sb-lost")
+    p._sandboxes["sb-lost"] = sandbox
+    p._thread_sandboxes[("u1", "t1")] = "sb-lost"
+    p._owned_sandbox_ids.add("sb-lost")
+    p._ownership = FakeOwnershipStore(
+        {"sb-lost": ("owner-peer", "own")},
+        owner_id=p._owner_id,
+    )
+
+    p._refresh_owned_leases()
+
+    assert p.get("sb-lost") is None
+    assert ("u1", "t1") not in p._thread_sandboxes
+    assert "sb-lost" not in p._owned_sandbox_ids
+    assert client.closed is True
 
 
 def test_reuse_in_process_sandbox_returns_cached_id_on_healthy_reuse():
@@ -614,6 +886,239 @@ def test_discover_remote_sandbox_skips_dead_candidate(monkeypatch):
     assert client.closed is True
 
 
+def test_discover_remote_sandbox_tries_later_candidate_when_first_is_dead(monkeypatch):
+    p = _make_provider()
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    fake_cls.list_return = [
+        _info("sb-a-dead", "u1", "t1"),
+        _info("sb-b-live", "u1", "t1"),
+    ]
+    dead = FakeClient(
+        sandbox_id="sb-a-dead",
+        commands=FakeCommandsAPI([FakeCommandsAPI.GONE]),
+    )
+    live = FakeClient(sandbox_id="sb-b-live")
+    fake_cls.connect_factory = lambda sid, **_kw: dead if sid == "sb-a-dead" else live
+
+    assert p._discover_remote_sandbox("t1", user_id="u1") == "sb-b-live"
+    assert dead.closed is True
+    assert p._thread_sandboxes[("u1", "t1")] == "sb-b-live"
+    assert "sb-b-live" in p._owned_sandbox_ids
+
+
+def test_reconcile_defers_duplicate_with_live_peer_lease(monkeypatch):
+    p = _make_provider()
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    fake_cls.list_return = [
+        _info("sb-canonical", "u1", "t1"),
+        _info("sb-duplicate", "u1", "t1"),
+    ]
+    clients = {
+        "sb-canonical": FakeClient(sandbox_id="sb-canonical"),
+        "sb-duplicate": FakeClient(sandbox_id="sb-duplicate"),
+    }
+    fake_cls.connect_factory = lambda sid, **_kw: clients[sid]
+    leases = {"sb-duplicate": ("owner-peer", "own")}
+    p._ownership = FakeOwnershipStore(leases, owner_id=p._owner_id)
+    p._config["reconciliation_grace_seconds"] = 0.0
+
+    stats = p._reconcile_remote_sandboxes(now=time.monotonic())
+
+    assert stats.adopted == 1
+    assert stats.deferred == 1
+    assert stats.killed == 0
+    assert clients["sb-duplicate"].killed is False
+
+
+def test_reconcile_kills_unowned_duplicate_after_grace(monkeypatch):
+    p = _make_provider()
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    fake_cls.list_return = [
+        _info("sb-canonical", "u1", "t1"),
+        _info("sb-duplicate", "u1", "t1"),
+    ]
+    clients = {
+        "sb-canonical": FakeClient(sandbox_id="sb-canonical"),
+        "sb-duplicate": FakeClient(sandbox_id="sb-duplicate"),
+    }
+    fake_cls.connect_factory = lambda sid, **_kw: clients[sid]
+    p._config["reconciliation_grace_seconds"] = 5.0
+
+    first = p._reconcile_remote_sandboxes(now=100.0)
+    second = p._reconcile_remote_sandboxes(now=106.0)
+
+    assert first.deferred == 1
+    assert first.killed == 0
+    assert second.killed == 1
+    assert clients["sb-duplicate"].killed is True
+
+
+def test_competing_reconcilers_only_one_kills_duplicate(monkeypatch):
+    shared_leases: dict[str, tuple[str, str]] = {}
+    shared_lock = threading.Lock()
+    providers = [_make_provider(), _make_provider()]
+    providers[0]._owner_id = "owner-a"
+    providers[1]._owner_id = "owner-b"
+    clients = {
+        "sb-canonical": FakeClient(sandbox_id="sb-canonical"),
+        "sb-duplicate": FakeClient(sandbox_id="sb-duplicate"),
+    }
+    kill_count = 0
+
+    def kill_duplicate() -> None:
+        nonlocal kill_count
+        kill_count += 1
+        clients["sb-duplicate"].killed = True
+        clients["sb-duplicate"].commands._responses.append(FakeCommandsAPI.GONE)
+
+    clients["sb-duplicate"].kill = kill_duplicate
+
+    for provider in providers:
+        fake_cls = _install_fake_sdk(monkeypatch, provider)
+        fake_cls.list_return = [
+            _info("sb-canonical", "u1", "t1"),
+            _info("sb-duplicate", "u1", "t1"),
+        ]
+        fake_cls.connect_factory = lambda sid, **_kw: clients[sid]
+        provider._ownership = FakeOwnershipStore(
+            shared_leases,
+            owner_id=provider._owner_id,
+            lock=shared_lock,
+        )
+        provider._config["reconciliation_grace_seconds"] = 0.0
+
+    results = [provider._reconcile_remote_sandboxes(now=100.0) for provider in providers]
+
+    assert sum(result.killed for result in results) == 1
+    assert kill_count == 1
+
+
+def test_reconcile_honors_item_budget(monkeypatch):
+    p = _make_provider()
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    fake_cls.list_return = [_info(f"sb-{index}", "u1", f"t-{index}") for index in range(5)]
+    p._config["reconciliation_max_items"] = 2
+
+    stats = p._reconcile_remote_sandboxes(now=100.0)
+
+    assert stats.discovered == 2
+    assert len(fake_cls.connect_calls) == 2
+
+
+def test_reconcile_honors_page_budget(monkeypatch):
+    p = _make_provider()
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    paginator = _FakePaginator(
+        [
+            [_info("sb-first", "u1", "t1")],
+            [_info("sb-never-read", "u2", "t2")],
+        ]
+    )
+    fake_cls.list_return = paginator
+    p._config["reconciliation_max_pages"] = 1
+
+    stats = p._reconcile_remote_sandboxes(now=100.0)
+
+    assert stats.discovered == 1
+    assert stats.budget_exhausted is True
+    assert paginator.calls == 1
+    assert [call[0] for call in fake_cls.connect_calls] == ["sb-first"]
+
+
+def test_reconcile_honors_wall_clock_budget(monkeypatch):
+    p = _make_provider()
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    fake_cls.list_return = [_info("sb-never-probed", "u1", "t1")]
+    p._config["reconciliation_max_seconds"] = 0.5
+    provider_mod = importlib.import_module("deerflow.community.e2b_sandbox.e2b_sandbox_provider")
+    ticks = iter([0.0, 0.0, 1.0, 1.0])
+    monkeypatch.setattr(provider_mod.time, "monotonic", lambda: next(ticks))
+
+    stats = p._reconcile_remote_sandboxes(now=100.0)
+
+    assert stats.budget_exhausted is True
+    assert fake_cls.connect_calls == []
+
+
+def test_reconcile_adopts_canonical_after_restart_loses_local_state(monkeypatch):
+    p = _make_provider()
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    fake_cls.list_return = [_info("sb-existing", "u1", "t1")]
+
+    stats = p._reconcile_remote_sandboxes(now=100.0)
+
+    assert stats.adopted == 1
+    assert p._thread_sandboxes[("u1", "t1")] == "sb-existing"
+    assert "sb-existing" in p._owned_sandbox_ids
+
+
+def test_reconcile_bootstrap_failure_clears_inflight_after_peer_take(monkeypatch):
+    p = _make_provider()
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    sandbox_id = "sb-racy-bootstrap"
+    fake_cls.list_return = [_info(sandbox_id, "u1", "t1")]
+    shared_leases: dict[str, tuple[str, str]] = {}
+    shared_lock = threading.Lock()
+    p._ownership = FakeOwnershipStore(
+        shared_leases,
+        owner_id=p._owner_id,
+        lock=shared_lock,
+    )
+    peer_ownership = FakeOwnershipStore(
+        shared_leases,
+        owner_id="owner-peer",
+        lock=shared_lock,
+    )
+
+    def peer_takes_before_bootstrap_fails(_command: str) -> SimpleNamespace:
+        assert peer_ownership.take(sandbox_id) is True
+        return SimpleNamespace(stdout="", stderr="permission denied", exit_code=1)
+
+    client = FakeClient(
+        sandbox_id=sandbox_id,
+        commands=FakeCommandsAPI(
+            [
+                SimpleNamespace(stdout="ok", stderr="", exit_code=0),
+                peer_takes_before_bootstrap_fails,
+            ]
+        ),
+    )
+    fake_cls.connect_factory = lambda _sid, **_kw: client
+
+    stats = p._reconcile_remote_sandboxes(now=100.0)
+
+    assert stats.adopted == 0
+    assert stats.deferred == 1
+    assert sandbox_id not in p._acquire_inflight
+    assert sandbox_id not in p._unowned_remote_ops_in_progress
+    assert p._reserved_slots == 0
+    assert p._ownership.owner(sandbox_id) == "owner-peer"
+    assert client.killed is False
+    assert client.closed is True
+
+
+def test_reconcile_kills_metadata_orphan_only_after_ttl(monkeypatch):
+    p = _make_provider()
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    fake_cls.list_return = [
+        SimpleNamespace(
+            sandbox_id="sb-orphan",
+            metadata={"deer_flow_provider": "e2b_sandbox_provider"},
+        )
+    ]
+    client = FakeClient(sandbox_id="sb-orphan")
+    fake_cls.connect_factory = lambda _sid, **_kw: client
+    p._config["reconciliation_orphan_ttl_seconds"] = 5.0
+
+    first = p._reconcile_remote_sandboxes(now=100.0)
+    second = p._reconcile_remote_sandboxes(now=106.0)
+
+    assert first.deferred == 1
+    assert first.killed == 0
+    assert second.killed == 1
+    assert client.killed is True
+
+
 def test_discover_remote_sandbox_discards_candidate_when_bootstrap_fails(monkeypatch):
     p = _make_provider()
     fake_cls = _install_fake_sdk(monkeypatch, p)
@@ -635,13 +1140,78 @@ def test_discover_remote_sandbox_discards_candidate_when_bootstrap_fails(monkeyp
     assert ("u1", "t1") not in p._thread_sandboxes
 
 
+def test_discovery_claims_ownership_before_bootstrap_cleanup(monkeypatch):
+    events: list[str] = []
+
+    class RecordingOwnershipStore(FakeOwnershipStore):
+        def take(self, sandbox_id: str) -> bool:
+            events.append("take")
+            return super().take(sandbox_id)
+
+        def claim(self, sandbox_id: str, *, for_destroy: bool = False) -> bool:
+            events.append("claim-destroy" if for_destroy else "claim")
+            return super().claim(sandbox_id, for_destroy=for_destroy)
+
+        def release(self, sandbox_id: str) -> None:
+            events.append("release")
+            super().release(sandbox_id)
+
+    p = _make_provider()
+    p._ownership = RecordingOwnershipStore(
+        {"sb-broken": ("owner-peer", "own")},
+        owner_id=p._owner_id,
+    )
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    fake_cls.list_return = [_info("sb-broken", "u1", "t1")]
+    client = FakeClient(
+        sandbox_id="sb-broken",
+        commands=FakeCommandsAPI(
+            [
+                SimpleNamespace(stdout="ok", stderr="", exit_code=0),
+                SimpleNamespace(stdout="", stderr="permission denied", exit_code=1),
+            ]
+        ),
+    )
+    client.kill = lambda: events.append("kill")
+    fake_cls.connect_factory = lambda _sid, **_kw: client
+
+    assert p._discover_remote_sandbox("t1", user_id="u1") is None
+    assert events == ["take", "claim-destroy", "kill", "release"]
+
+
+def test_bootstrap_failure_does_not_kill_without_destroy_lease(monkeypatch):
+    p = _make_provider()
+    client = FakeClient(
+        sandbox_id="sb-peer",
+        commands=FakeCommandsAPI([SimpleNamespace(stdout="", stderr="permission denied", exit_code=1)]),
+    )
+    p._ownership = FakeOwnershipStore(
+        {"sb-peer": ("owner-peer", "own")},
+        owner_id=p._owner_id,
+    )
+
+    error, remote_destroyed = p._bootstrap_or_discard(client, "sb-peer")
+
+    assert error is not None
+    assert remote_destroyed is False
+    assert client.killed is False
+    assert client.closed is True
+    assert p._ownership.owner("sb-peer") == "owner-peer"
+
+
 def test_kill_client_returns_exception_without_raising():
     p = _make_provider()
-    client = FakeClient()
+    store = _install_shared_deployment_capacity(p)
+    failed_client = FakeClient()
     error = RuntimeError("already gone")
-    client.kill = MagicMock(side_effect=error)
+    failed_client.kill = MagicMock(side_effect=error)
 
-    assert p._kill_client(client) is error
+    assert p._kill_client(failed_client) is error
+    store.release.assert_not_called()
+
+    client = FakeClient()
+    assert p._kill_client(client) is None
+    store.release.assert_called_once_with(client.sandbox_id)
 
 
 def test_kill_client_reports_uncertain_cleanup_without_callable_kill():
@@ -728,6 +1298,48 @@ def test_evict_oldest_warm_keeps_slot_when_kill_lookup_raises(monkeypatch):
     assert client.closed is True
     assert p._eviction_tombstones == {"sb-warm"}
     assert p._transitioning_slots == 1
+    assert "sb-warm" not in p._warm_pool
+    assert "sb-warm" not in p._owned_sandbox_ids
+    assert p._ownership.owner("sb-warm") is None
+
+
+def test_evict_oldest_warm_defers_peer_owned_sandbox(monkeypatch):
+    p = _make_provider()
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    p._warm_pool["sb-peer"] = ("seed", 12345.0)
+    p._ownership = FakeOwnershipStore(
+        {"sb-peer": ("owner-peer", "own")},
+        owner_id=p._owner_id,
+    )
+
+    assert p._evict_oldest_warm() == "sb-peer"
+
+    assert fake_cls.connect_calls == []
+    assert "sb-peer" not in p._warm_pool
+    assert p._eviction_tombstones == set()
+    assert p._evictions_in_progress == set()
+    assert p._transitioning_slots == 0
+    assert p._ownership.owner("sb-peer") == "owner-peer"
+
+
+def test_evict_oldest_warm_releases_destroy_lease_after_kill_failure(monkeypatch):
+    p = _make_provider()
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+    client = FakeClient(sandbox_id="sb-warm")
+    client.kill = MagicMock(side_effect=RuntimeError("transient kill failure"))
+    fake_cls.connect_factory = lambda _sid, **_kw: client
+    p._warm_pool["sb-warm"] = ("seed", 12345.0)
+    p._owned_sandbox_ids.add("sb-warm")
+    p._ownership.take("sb-warm")
+
+    assert p._evict_oldest_warm() is None
+
+    assert client.closed is True
+    assert "sb-warm" not in p._warm_pool
+    assert p._eviction_tombstones == {"sb-warm"}
+    assert p._transitioning_slots == 1
+    assert "sb-warm" not in p._owned_sandbox_ids
+    assert p._ownership.owner("sb-warm") is None
 
 
 def test_evict_oldest_warm_uses_kill_helper_and_closes_client(monkeypatch):
@@ -935,6 +1547,23 @@ def test_release_skips_warm_pool_when_sync_reveals_dead_vm(monkeypatch, tmp_path
     assert sb.is_dead is True
     assert "sb-died-during-sync" not in p._warm_pool
     assert client.killed is True
+
+
+def test_shutdown_only_kills_sandboxes_owned_by_current_instance(monkeypatch):
+    p = _make_provider()
+    owned_client = FakeClient(sandbox_id="sb-owned")
+    peer_client = FakeClient(sandbox_id="sb-peer")
+    p._sandboxes = {
+        "sb-owned": _make_sandbox(owned_client),
+        "sb-peer": _make_sandbox(peer_client),
+    }
+    p._owned_sandbox_ids = {"sb-owned"}
+
+    p.shutdown()
+
+    assert owned_client.killed is True
+    assert peer_client.killed is False
+    assert peer_client.closed is True
 
 
 def _setup_paths(monkeypatch, tmp_path):
@@ -1234,6 +1863,29 @@ def test_sync_outputs_to_host_is_noop_when_client_closed():
     sb = _make_sandbox(FakeClient(), sandbox_id="sb-x")
     sb.close()
     p._sync_outputs_to_host(sb, thread_id="t1", user_id="u1")
+
+
+def test_read_file_supports_bounded_ranges():
+    files = FakeFilesAPI(
+        store={"/home/user/workspace/range.txt": b"line 1\nline 2\nline 3\nline 4\nline 5"},
+    )
+    client = FakeClient(files=files)
+    sb = _make_sandbox(client, sandbox_id="sb-read-range")
+
+    assert sb.read_file("/mnt/user-data/workspace/range.txt") == "line 1\nline 2\nline 3\nline 4\nline 5"
+    assert sb.read_file("/mnt/user-data/workspace/range.txt", start_line=2, end_line=4) == "line 2\nline 3\nline 4"
+    assert sb.read_file("/mnt/user-data/workspace/range.txt", start_line=4) == "line 4\nline 5"
+    assert sb.read_file("/mnt/user-data/workspace/range.txt", end_line=2) == "line 1\nline 2"
+
+    resolved_path = "/home/user/workspace/range.txt"
+    assert all(path == resolved_path for path, _fmt in files.read_calls), files.read_calls
+
+
+def test_read_file_returns_error_for_missing_file():
+    client = FakeClient(files=FakeFilesAPI())
+    sb = _make_sandbox(client, sandbox_id="sb-read-missing")
+
+    assert sb.read_file("/mnt/user-data/workspace/missing.txt").startswith("Error:")
 
 
 def _outputs_dir(tmp_path):
@@ -1569,9 +2221,144 @@ def test_grep_without_glob_is_unaffected():
     assert truncated is False
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+def test_grep_single_file_path_with_matching_glob():
+    """A basename glob must also apply when the search root is one file."""
+    raw_stdout = "/home/user/uploads/report.md:2:needle here\n"
+    client = FakeClient(commands=FakeCommandsAPI([SimpleNamespace(stdout=raw_stdout, stderr="", exit_code=0)]))
+    sb = _make_sandbox(client)
+
+    matches, truncated = sb.grep("/mnt/user-data/uploads/report.md", "needle", glob="*.md")
+
+    assert [m.path for m in matches] == ["/home/user/uploads/report.md"]
+    assert truncated is False
+
+
 # Capacity enforcement tests (#4339)
-# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_deployment_capacity_reserves_commits_and_rejects_globally(monkeypatch) -> None:
+    gateway_a = _make_provider(replicas=1, overflow_policy="reject")
+    gateway_b = _make_provider(replicas=1, overflow_policy="reject")
+    store = _install_shared_deployment_capacity(
+        gateway_a,
+        gateway_b,
+        reserve_results=[ReserveStatus.GRANTED, ReserveStatus.FULL],
+    )
+    sdk_a = _install_fake_sdk(monkeypatch, gateway_a)
+    sdk_b = FakeSandboxClass()
+    monkeypatch.setattr(gateway_b, "_get_sandbox_cls", lambda: sdk_b)
+
+    sandbox_id = gateway_a.acquire("thread-a", user_id="user-a")
+    with pytest.raises(SandboxCapacityExceededError):
+        gateway_b.acquire("thread-b", user_id="user-b")
+
+    metadata = sdk_a.create_calls[0]["metadata"]
+    assert metadata["deer_flow_capacity_ledger"] == store.key
+    assert metadata["deer_flow_capacity_reservation"]
+    store.track.assert_called_once_with(
+        sandbox_id,
+        reservation_token=metadata["deer_flow_capacity_reservation"],
+    )
+    assert len(sdk_a.create_calls) == 1
+    assert sdk_b.create_calls == []
+    assert store.reserve.call_count == 2
+
+
+def test_ambiguous_create_failure_retains_deployment_reservation(monkeypatch) -> None:
+    provider = _make_provider(replicas=1, overflow_policy="reject")
+    store = _install_shared_deployment_capacity(provider)
+    sdk = _install_fake_sdk(monkeypatch, provider)
+    sdk.create_factory = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("control-plane timeout"))
+
+    with pytest.raises(RuntimeError, match="control-plane timeout"):
+        provider.acquire("thread-a", user_id="user-a")
+
+    assert provider._reserved_slots == 0
+    store.reserve.assert_called_once()
+    store.track.assert_not_called()
+    store.release.assert_not_called()
+
+
+def test_discovery_uses_sdk_query_and_tracks_without_reserving(monkeypatch) -> None:
+    provider = _make_provider(replicas=1, overflow_policy="reject")
+    store = _install_shared_deployment_capacity(provider)
+    sdk = _install_fake_sdk(monkeypatch, provider)
+    entry = SimpleNamespace(
+        sandbox_id="sandbox-existing",
+        metadata={
+            "deer_flow_provider": "e2b_sandbox_provider",
+            "deer_flow_user": "user-a",
+            "deer_flow_thread": "thread-a",
+            "deer_flow_capacity_ledger": store.key,
+        },
+    )
+    expected_query = {key: entry.metadata[key] for key in ("deer_flow_provider", "deer_flow_user", "deer_flow_thread")}
+    sdk.list_return = SimpleNamespace(
+        has_next=False,
+        next_items=lambda: [entry] if sdk.list_calls[-1]["query"].metadata == expected_query else [],
+    )
+    assert provider.acquire("thread-a", user_id="user-a") == entry.sandbox_id
+    assert sdk.create_calls == []
+    store.reserve.assert_not_called()
+    store.track.assert_called_once_with(entry.sandbox_id, reservation_token=None)
+
+
+def test_reconciliation_repairs_crash_and_uses_safe_reservation_age(monkeypatch) -> None:
+    provider = _make_provider(replicas=1, overflow_policy="reject")
+    provider._ownership_config.renewal_interval_seconds = 1.0
+    provider._ownership_config.ttl_multiplier = 2.0
+    provider._config["reconciliation_grace_seconds"] = 0.0
+    store = _install_shared_deployment_capacity(provider)
+    sdk = _install_fake_sdk(monkeypatch, provider)
+    sdk.list_return = [
+        {
+            "sandbox_id": "sandbox-existing",
+            "metadata": {
+                "deer_flow_provider": "e2b_sandbox_provider",
+                "deer_flow_capacity_ledger": store.key,
+                "deer_flow_capacity_reservation": "reservation-crashed",
+            },
+        },
+        {
+            "sandbox_id": "sandbox-other-deployment",
+            "metadata": {
+                "deer_flow_provider": "e2b_sandbox_provider",
+                "deer_flow_capacity_ledger": "deerflow:other:e2b-capacity",
+            },
+        },
+    ]
+
+    stats = provider._reconcile_remote_sandboxes(now=100.0)
+    args = store.reconcile.call_args.kwargs
+    assert stats.discovered == 1
+    assert args["remote_sandboxes"] == {"sandbox-existing": "reservation-crashed"}
+    assert args["complete"] is True
+    assert args["reservation_max_age_ms"] == 120_000
+
+
+def test_failed_inventory_and_redis_error_both_prevent_create(monkeypatch) -> None:
+    provider = _make_provider(replicas=1, overflow_policy="reject")
+    store = _install_shared_deployment_capacity(
+        provider,
+        reserve_results=[ReserveStatus.NOT_READY],
+    )
+    sdk = _install_fake_sdk(monkeypatch, provider)
+    sdk.list = MagicMock(side_effect=RuntimeError("E2B unavailable"))
+
+    provider._reconcile_remote_sandboxes(now=100.0)
+
+    reconcile_args = store.reconcile.call_args.kwargs
+    assert reconcile_args["complete"] is False
+    assert reconcile_args["remote_sandboxes"] == {}
+    with pytest.raises(SandboxCapacityExceededError):
+        provider._create_sandbox("thread-a", user_id="user-a")
+    store.reserve.side_effect = CapacityBackendError("Redis unavailable")
+    with pytest.raises(SandboxCapacityExceededError) as error:
+        provider._create_sandbox("thread-a", user_id="user-a")
+
+    assert error.value.reason == "capacity_backend"
+    assert sdk.create_calls == []
+    assert provider._reserved_slots == 0
 
 
 def test_capacity_reject_policy_raises_when_full(monkeypatch):
@@ -1608,7 +2395,11 @@ def test_capacity_reject_frees_slot_on_release(monkeypatch):
 
 def test_capacity_reject_evicts_other_thread_warm_entry_before_create(monkeypatch):
     """Reject policy can evict one warm VM before it rejects new capacity."""
-    p = _make_provider(replicas=1, overflow_policy="reject")
+    p = _make_provider(replicas=3, overflow_policy="reject")
+    store = _install_shared_deployment_capacity(
+        p,
+        reserve_results=[ReserveStatus.GRANTED, ReserveStatus.FULL, ReserveStatus.GRANTED],
+    )
     fake_cls = _install_fake_sdk(monkeypatch, p)
 
     sid1 = p.acquire("t1", user_id="u1")
@@ -1620,6 +2411,7 @@ def test_capacity_reject_evicts_other_thread_warm_entry_before_create(monkeypatc
     assert sid2 != sid1
     assert len(p._warm_pool) == 0
     assert len(fake_cls.create_calls) == 2
+    store.release.assert_called_once_with(sid1)
 
 
 def test_capacity_wait_policy_times_out(monkeypatch):
@@ -2792,8 +3584,14 @@ def test_shutdown_during_discovery_does_not_kill_unowned_vm(monkeypatch):
     allow_commit = threading.Event()
     reserve_capacity = p._reserve_capacity
 
-    def pause_after_reserve(thread_id, user_id, *, remote_id=None, remote_owned=True):
-        reserve_capacity(
+    def pause_after_reserve(
+        thread_id,
+        user_id,
+        *,
+        remote_id=None,
+        remote_owned=True,
+    ):
+        reservation = reserve_capacity(
             thread_id,
             user_id,
             remote_id=remote_id,
@@ -2801,6 +3599,7 @@ def test_shutdown_during_discovery_does_not_kill_unowned_vm(monkeypatch):
         )
         reserved.set()
         assert allow_commit.wait(timeout=2)
+        return reservation
 
     monkeypatch.setattr(p, "_reserve_capacity", pause_after_reserve)
     result: list[str | None] = []

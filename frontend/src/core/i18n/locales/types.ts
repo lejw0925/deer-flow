@@ -40,7 +40,11 @@ export interface Translations {
     exportAsMarkdown: string;
     exportAsJSON: string;
     exportSuccess: string;
+    exportFailed: string;
     regenerate: string;
+    editAndRerun: string;
+    updateAndRerun: string;
+    editRerunWarning: string;
     branch: string;
     showArtifacts: string;
     browser: string;
@@ -78,6 +82,26 @@ export interface Translations {
     copiedToClipboard: string;
     failedToCopyToClipboard: string;
     linkCopied: string;
+  };
+
+  artifactEditing: {
+    unsaved: string;
+    saving: string;
+    saved: string;
+    exit: string;
+    discard: string;
+    discardChanges: string;
+    conflict: string;
+    conflictShort: string;
+    runInProgress: string;
+    saveFailed: string;
+  };
+
+  artifactPreview: {
+    limited: (previewSize: string, totalSize?: string) => string;
+    loadFullFile: string;
+    loadingFullFile: string;
+    previewFailed: string;
   };
 
   // Citations
@@ -405,6 +429,7 @@ export interface Translations {
     startConversation: string;
     branchCreated: string;
     branchFailed: string;
+    streamReplayGap: string;
   };
 
   // Chats
@@ -413,6 +438,9 @@ export interface Translations {
     loadMoreToSearch: string;
     loadingMore: string;
     loadOlderChats: string;
+    pinChat: string;
+    unpinChat: string;
+    pinChatFailed: string;
   };
 
   // Sidecar
@@ -511,6 +539,9 @@ export interface Translations {
     otherPlaceholder: string;
     submit: string;
     emptyError: string;
+    requiredError: string;
+    requiredA11yLabel: string;
+    selectPlaceholder: string;
     answeredValue: (value: string) => string;
   };
 
@@ -569,6 +600,12 @@ export interface Translations {
     completeTodo: (content: string) => string;
     updateTodo: (content: string) => string;
     removeTodo: (content: string) => string;
+  };
+
+  contextUsage: {
+    label: string;
+    title: string;
+    badgeAriaLabel: (percentage: string) => string;
   };
 
   // Shortcuts
@@ -715,6 +752,7 @@ export interface Translations {
         auth: string;
         sandboxRuntime: string;
         sandboxRuntimeInitContainer: string;
+        sandboxRuntimeBroker: string;
         sandboxRuntimeGatewayDownload: string;
         sandboxRuntimeNotReady: string;
         notInstalled: string;
@@ -731,6 +769,17 @@ export interface Translations {
         connectedAction: string;
         requestPermissions: string;
         alreadyConnected: string;
+        changeAppButton: string;
+        changeAppTitle: string;
+        changeAppDescription: string;
+        changeAppIdLabel: string;
+        changeAppSecretLabel: string;
+        changeAppAuthResetNote: string;
+        changeAppSubmit: string;
+        changeAppReRegister: string;
+        changeAppSwitched: string;
+        brandFeishu: string;
+        brandLark: string;
         connectionStarted: string;
         connectionReady: string;
         authStarted: string;

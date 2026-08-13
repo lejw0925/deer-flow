@@ -6,6 +6,7 @@ import {
   extractTextFromMessage,
   extractReasoningContentFromMessage,
   getBranchableAssistantGroupIds,
+  getLatestEditableTurn,
   getMessageCopyData,
   getAssistantTurnCopyData,
   getAssistantTurnUsageMessages,
@@ -134,6 +135,88 @@ describe("branchable assistant groups", () => {
   });
 });
 
+describe("latest editable user turn", () => {
+  test("returns the latest completed human turn", () => {
+    const messages = [
+      { id: "human-1", type: "human", content: "First question" },
+      { id: "ai-history", type: "ai", content: "Historical answer" },
+      { id: "human-2", type: "human", content: "Use tools" },
+      {
+        id: "ai-tool",
+        type: "ai",
+        content: "",
+        tool_calls: [{ id: "tool-1", name: "web_search", args: {} }],
+      },
+      {
+        id: "tool-result",
+        type: "tool",
+        name: "web_search",
+        tool_call_id: "tool-1",
+        content: "result",
+      },
+      { id: "ai-final", type: "ai", content: "Final answer" },
+    ] as Message[];
+
+    const turn = getLatestEditableTurn(getMessageGroups(messages), false);
+
+    expect(turn?.humanMessage.id).toBe("human-2");
+  });
+
+  test("returns null while the current turn is loading", () => {
+    const messages = [
+      { id: "human-1", type: "human", content: "Question" },
+      { id: "ai-1", type: "ai", content: "Answer" },
+    ] as Message[];
+
+    expect(getLatestEditableTurn(getMessageGroups(messages), true)).toBeNull();
+  });
+
+  test("returns null when the latest turn has no final assistant text", () => {
+    const messages = [
+      { id: "human-1", type: "human", content: "Question" },
+      {
+        id: "ai-tool",
+        type: "ai",
+        content: "",
+        tool_calls: [{ id: "tool-1", name: "web_search", args: {} }],
+      },
+      {
+        id: "tool-result",
+        type: "tool",
+        name: "web_search",
+        tool_call_id: "tool-1",
+        content: "result",
+      },
+    ] as Message[];
+
+    expect(getLatestEditableTurn(getMessageGroups(messages), false)).toBeNull();
+  });
+
+  test("returns null when the latest assistant text still has tool calls", () => {
+    const messages = [
+      { id: "human-1", type: "human", content: "Question" },
+      {
+        id: "ai-tool",
+        type: "ai",
+        content: "Let me search first.",
+        tool_calls: [{ id: "tool-1", name: "web_search", args: {} }],
+      },
+    ] as Message[];
+
+    expect(getLatestEditableTurn(getMessageGroups(messages), false)).toBeNull();
+  });
+
+  test("returns null when a later human turn is incomplete", () => {
+    const messages = [
+      { id: "human-1", type: "human", content: "First question" },
+      { id: "ai-1", type: "ai", content: "First answer" },
+      { id: "human-2", type: "human", content: "Follow up" },
+    ] as Message[];
+
+    expect(getLatestEditableTurn(getMessageGroups(messages), false)).toBeNull();
+  });
+});
+
 test("reasoning + content (no tool calls) yields a single assistant bubble, not a duplicate processing group", () => {
   // Regression for #3868: in thinking/pro/ultra modes the final assistant
   // message carries both reasoning_content and answer text. It must surface its
@@ -159,6 +242,92 @@ test("reasoning + content (no tool calls) yields a single assistant bubble, not 
   // aggregation never double-counts it (see #2770).
   const turnUsage = getAssistantTurnUsageMessages(groups);
   expect(turnUsage.at(-1)?.map((message) => message.id)).toEqual(["ai-1"]);
+});
+
+test("keeps unresolved streaming text in the processing group when tool calls arrive later", () => {
+  const textOnlyMessages = [
+    { id: "human-1", type: "human", content: "Create a presentation" },
+    {
+      id: "ai-1",
+      type: "ai",
+      content: "I will inspect the source material first.",
+    },
+  ] as Message[];
+
+  const textOnlyGroups = getMessageGroups(textOnlyMessages, {
+    isCurrentTurnLoading: true,
+  });
+  expect(textOnlyGroups.map((group) => group.type)).toEqual([
+    "human",
+    "assistant:processing",
+  ]);
+
+  const withToolCall = [
+    textOnlyMessages[0],
+    {
+      ...textOnlyMessages[1],
+      tool_calls: [
+        { id: "call-1", name: "read_file", args: { path: "slides.md" } },
+      ],
+    },
+  ] as Message[];
+  const toolCallGroups = getMessageGroups(withToolCall, {
+    isCurrentTurnLoading: true,
+  });
+  expect(toolCallGroups.map((group) => group.type)).toEqual([
+    "human",
+    "assistant:processing",
+  ]);
+  expect(toolCallGroups[1]?.id).toBe(textOnlyGroups[1]?.id);
+
+  expect(getMessageGroups(textOnlyMessages).map((group) => group.type)).toEqual(
+    ["human", "assistant"],
+  );
+});
+
+test("keeps post-tool streaming text in the processing group until the turn settles", () => {
+  const messages = [
+    { id: "human-1", type: "human", content: "Inspect and summarize" },
+    {
+      id: "ai-1",
+      type: "ai",
+      content: "I will inspect the current implementation.",
+      tool_calls: [
+        { id: "call-1", name: "read_file", args: { path: "source.ts" } },
+      ],
+    },
+    {
+      id: "tool-1",
+      type: "tool",
+      name: "read_file",
+      tool_call_id: "call-1",
+      content: "file contents",
+    },
+    {
+      id: "ai-2",
+      type: "ai",
+      content: "Here is the final streamed answer.",
+    },
+  ] as Message[];
+
+  const loadingGroups = getMessageGroups(messages, {
+    isCurrentTurnLoading: true,
+  });
+  expect(loadingGroups.map((group) => group.type)).toEqual([
+    "human",
+    "assistant:processing",
+  ]);
+  expect(loadingGroups[1]?.messages.map((message) => message.id)).toEqual([
+    "ai-1",
+    "tool-1",
+    "ai-2",
+  ]);
+
+  expect(getMessageGroups(messages).map((group) => group.type)).toEqual([
+    "human",
+    "assistant:processing",
+    "assistant",
+  ]);
 });
 
 test("keeps tool-call reasoning in the processing group while the final answer's reasoning rides its own bubble", () => {
@@ -285,6 +454,30 @@ describe("inline <think> tag splitting", () => {
     );
     expect(extractReasoningContentFromMessage(message)).toBeNull();
     expect(hasReasoning(message)).toBe(false);
+  });
+
+  test("a closed <think> pair inside markdown inline code stays in content", () => {
+    // The model talking about the tag literally, e.g. when explaining prompt
+    // engineering. Hollowing the code span out into the reasoning panel
+    // corrupts the visible answer.
+    const message = aiMessage(
+      "Wrap your reasoning in `<think>your reasoning</think>` before answering.",
+    );
+    expect(extractContentFromMessage(message)).toBe(
+      "Wrap your reasoning in `<think>your reasoning</think>` before answering.",
+    );
+    expect(extractReasoningContentFromMessage(message)).toBeNull();
+    expect(hasReasoning(message)).toBe(false);
+  });
+
+  test("a closed <think> pair outside code is still stripped when another sits in inline code", () => {
+    const message = aiMessage(
+      "<think>real reasoning</think>Use `<think>text</think>` markers.",
+    );
+    expect(extractContentFromMessage(message)).toBe(
+      "Use `<think>text</think>` markers.",
+    );
+    expect(extractReasoningContentFromMessage(message)).toBe("real reasoning");
   });
 
   test("a backtick-prefixed <think> mid-stream is not split into reasoning", () => {
@@ -434,6 +627,31 @@ describe("human message internal context stripping", () => {
     ]);
   });
 
+  test("parses uploaded filenames that contain parentheses", () => {
+    // Browsers name duplicate downloads "photo (1).png"; the backend emits the
+    // filename verbatim, so the parser must not stop the name at the first "(".
+    const content =
+      "<current_uploads>\nThe following files were uploaded in this message:\n\n- photo (1).png (12.3 KB)\n  Path: /mnt/user-data/uploads/photo (1).png\n- report (final) (2).docx (1.5 MB)\n  Path: /mnt/user-data/uploads/report (final) (2).docx\n- normal.pdf (3.0 KB)\n  Path: /mnt/user-data/uploads/normal.pdf\n</current_uploads>\n\nSummarize";
+
+    expect(parseUploadedFiles(content)).toEqual([
+      {
+        filename: "photo (1).png",
+        size: Math.round(12.3 * 1024),
+        path: "/mnt/user-data/uploads/photo (1).png",
+      },
+      {
+        filename: "report (final) (2).docx",
+        size: Math.round(1.5 * 1024 * 1024),
+        path: "/mnt/user-data/uploads/report (final) (2).docx",
+      },
+      {
+        filename: "normal.pdf",
+        size: 3 * 1024,
+        path: "/mnt/user-data/uploads/normal.pdf",
+      },
+    ]);
+  });
+
   test("stripInternalMarkers removes current_uploads blocks on export", () => {
     const content =
       "<current_uploads>\n- paper.docx (177.6 KB)\n  Path: /mnt/user-data/uploads/paper.docx\n</current_uploads>\n\nExport me";
@@ -517,6 +735,22 @@ test("hides assistant copy data while that turn is streaming", () => {
 
   expect(getAssistantTurnCopyData(messages)).toBe("Partial answer");
   expect(getAssistantTurnCopyData(messages, { isStreaming: true })).toBeNull();
+});
+
+test("falls back to reasoning for a reasoning-only assistant turn's copy data", () => {
+  // A turn can end with reasoning but no answer text (e.g. stopped during
+  // thinking). getMessageCopyData already copies the reasoning in that case;
+  // the turn-level copy button must not disappear instead.
+  const messages = [
+    {
+      id: "ai-1",
+      type: "ai",
+      content: "",
+      additional_kwargs: { reasoning_content: "the actual reasoning" },
+    },
+  ] as Message[];
+
+  expect(getAssistantTurnCopyData(messages)).toBe("the actual reasoning");
 });
 
 test("marks the latest assistant message as streaming", () => {

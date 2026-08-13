@@ -51,7 +51,12 @@ export const enUS: Translations = {
     exportAsMarkdown: "Export as Markdown",
     exportAsJSON: "Export as JSON",
     exportSuccess: "Conversation exported",
+    exportFailed: "Failed to export conversation.",
     regenerate: "Regenerate",
+    editAndRerun: "Edit and rerun",
+    updateAndRerun: "Update and rerun",
+    editRerunWarning:
+      "Rerunning restores conversation state only. Files, memory, and external actions are not undone.",
     branch: "Branch conversation",
     showArtifacts: "Show artifacts of this conversation",
     browser: "Browser",
@@ -94,6 +99,31 @@ export const enUS: Translations = {
     copiedToClipboard: "Copied to clipboard",
     failedToCopyToClipboard: "Failed to copy to clipboard",
     linkCopied: "Link copied to clipboard",
+  },
+
+  artifactEditing: {
+    unsaved: "Unsaved",
+    saving: "Saving...",
+    saved: "Artifact saved",
+    exit: "Exit editing",
+    discard: "Discard changes",
+    discardChanges: "Discard the unsaved changes to this artifact?",
+    conflict:
+      "This artifact changed after you started editing. Discard your draft and reload before saving.",
+    conflictShort: "Changed remotely",
+    runInProgress: "Wait for the current agent run to finish before saving.",
+    saveFailed: "Failed to save artifact",
+  },
+
+  artifactPreview: {
+    limited: (previewSize, totalSize) =>
+      totalSize
+        ? `Showing the first ${previewSize} of ${totalSize}.`
+        : `Showing the first ${previewSize}.`,
+    loadFullFile: "Load full file",
+    loadingFullFile: "Loading full file...",
+    previewFailed:
+      "This file could not be previewed. You can still download it.",
   },
 
   // Citations
@@ -506,6 +536,8 @@ export const enUS: Translations = {
     startConversation: "Start a conversation to see messages here",
     branchCreated: "Conversation branch created",
     branchFailed: "Failed to branch conversation.",
+    streamReplayGap:
+      "Some live updates expired. The conversation was restored from saved state.",
   },
 
   // Chats
@@ -514,6 +546,9 @@ export const enUS: Translations = {
     loadMoreToSearch: "Load more to search older conversations",
     loadingMore: "Loading more...",
     loadOlderChats: "Load older chats",
+    pinChat: "Pin chat",
+    unpinChat: "Unpin chat",
+    pinChatFailed: "Failed to update pinned chat",
   },
 
   // Sidecar
@@ -565,6 +600,7 @@ export const enUS: Translations = {
     saveAndConnect: "Save and connect",
     saveChanges: "Save changes",
     descriptions: {
+      buzz: "Buzz channels and direct messages through your DeerFlow agent.",
       telegram: "Telegram direct messages through your DeerFlow bot.",
       slack: "Slack workspace messages and mentions.",
       discord: "Discord server messages through your DeerFlow bot.",
@@ -624,6 +660,9 @@ export const enUS: Translations = {
     otherPlaceholder: "Type another answer...",
     submit: "Submit",
     emptyError: "Enter an answer before submitting.",
+    requiredError: "Fill in all required fields before submitting.",
+    requiredA11yLabel: "required",
+    selectPlaceholder: "Select...",
     answeredValue: (value: string) => `Answered: ${value}`,
   },
 
@@ -684,6 +723,13 @@ export const enUS: Translations = {
     completeTodo: (content: string) => `Complete To-do: ${content}`,
     updateTodo: (content: string) => `Update To-do: ${content}`,
     removeTodo: (content: string) => `Remove To-do: ${content}`,
+  },
+
+  contextUsage: {
+    label: "Context",
+    title: "Context window",
+    badgeAriaLabel: (percentage: string) =>
+      `Context window ${percentage}% full`,
   },
 
   // Shortcuts
@@ -842,6 +888,7 @@ export const enUS: Translations = {
         auth: "Auth",
         sandboxRuntime: "Sandbox runtime",
         sandboxRuntimeInitContainer: "Provisioned by init container",
+        sandboxRuntimeBroker: "Provisioned by broker sidecar",
         sandboxRuntimeGatewayDownload: "Provisioned by Gateway",
         sandboxRuntimeNotReady:
           "Not ready — lark-cli may be missing at chat time",
@@ -864,6 +911,20 @@ export const enUS: Translations = {
         requestPermissions: "Request permissions",
         alreadyConnected:
           "Lark is already connected. If authorization expires, refresh the status and reconnect.",
+        changeAppButton: "Change Lark app",
+        changeAppTitle: "Switch to a different Lark app",
+        changeAppDescription:
+          "Point your DeerFlow account at a different Lark/Feishu app. This only affects your account; other users are not changed.",
+        changeAppIdLabel: "App ID",
+        changeAppSecretLabel: "App Secret",
+        changeAppAuthResetNote:
+          "Switching revokes the previous app's authorization. You will authorize the new app next.",
+        changeAppSubmit: "Switch app",
+        changeAppReRegister: "Re-register in browser",
+        changeAppSwitched:
+          "Lark app switched. Reconnect to authorize the new app.",
+        brandFeishu: "Feishu",
+        brandLark: "Lark",
         connectionStarted: "Connection link opened",
         connectionReady: "Connection is ready. Opening authorization...",
         authStarted:

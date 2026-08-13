@@ -58,14 +58,16 @@ def _browser_tools_enabled_in_config(config: AppConfig) -> bool:
 def _enforce_postgres_for_multi_worker(config: AppConfig) -> None:
     """Refuse unsafe multi-worker configurations before persistence starts.
 
-    Three checks (all must pass for multi-worker):
+    Four checks (all must pass for multi-worker):
 
     1. Process-local browser sessions must be disabled. Browser tools keep
        Chromium and Playwright objects in one worker's memory, while ordinary
        uvicorn dispatch provides no thread-id affinity.
     2. The DB backend must be Postgres — SQLite write-locks cannot support
        concurrent multi-process access.
-    3. ``run_ownership.heartbeat_enabled`` must be True — without heartbeat,
+    3. ``run_events.backend`` must be ``db``. Memory and JSONL stores are
+       process-local, so workers cannot enforce a shared singleton receipt.
+    4. ``run_ownership.heartbeat_enabled`` must be True — without heartbeat,
        every run has a NULL lease, so reconciliation treats all inflight
        runs as orphans and Worker B would kill Worker A's live runs on
        every rolling update or scale-up.
@@ -88,6 +90,14 @@ def _enforce_postgres_for_multi_worker(config: AppConfig) -> None:
     backend = getattr(config.database, "backend", None)
     if backend != "postgres":
         raise SystemExit(f"GATEWAY_WORKERS={workers} requires database.backend='postgres', but database.backend is '{backend}'. SQLite cannot support concurrent multi-process access. Set GATEWAY_WORKERS=1 or switch to Postgres.")
+
+    run_events_backend = getattr(getattr(config, "run_events", None), "backend", None)
+    if run_events_backend != "db":
+        raise SystemExit(
+            f"GATEWAY_WORKERS={workers} requires run_events.backend='db', but run_events.backend is '{run_events_backend}'. "
+            "Memory and JSONL event stores are process-local, so delivery receipt singleton guarantees cannot hold across workers. "
+            "Set GATEWAY_WORKERS=1 or configure run_events.backend: db."
+        )
 
     run_ownership = getattr(config, "run_ownership", None)
     if run_ownership is None or not run_ownership.heartbeat_enabled:
@@ -361,7 +371,7 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
     """
     from deerflow.persistence.engine import close_engine, get_session_factory, init_engine_from_config
     from deerflow.runtime import make_store, make_stream_bridge
-    from deerflow.runtime.checkpoint_mode import freeze_checkpoint_channel_mode
+    from deerflow.runtime.checkpoint_mode import freeze_checkpoint_channel_mode, freeze_checkpoint_snapshot_frequency
     from deerflow.runtime.checkpointer.async_provider import make_checkpointer
     from deerflow.runtime.events.store import make_run_event_store
 
@@ -375,8 +385,36 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
     _validate_agent_storage(startup_config)
 
     async with AsyncExitStack() as stack:
+        # Lifecycle and system-model hooks can originate on isolated subagent
+        # loops. Bind them to the Gateway's serving loop before any runtime
+        # dependency starts, then reset the binding last through the exit
+        # stack. Registering the callback synchronously here also covers every
+        # startup-failure and cancellation path below.
+        try:
+            from deerflow.extensions.notify import (
+                reset_extension_notify_loop,
+                set_extension_notify_loop,
+            )
+
+            set_extension_notify_loop(asyncio.get_running_loop())
+        except Exception:
+            logger.exception("Failed to register the extension notify loop; sync observations will be dropped")
+        else:
+
+            def reset_notify_loop_safely() -> None:
+                try:
+                    reset_extension_notify_loop()
+                except Exception:
+                    logger.debug(
+                        "Failed to reset the extension notify loop (non-fatal)",
+                        exc_info=True,
+                    )
+
+            stack.callback(reset_notify_loop_safely)
+
         config = startup_config
         app.state.checkpoint_channel_mode = freeze_checkpoint_channel_mode(config.database.checkpoint_channel_mode)
+        app.state.checkpoint_snapshot_frequency = freeze_checkpoint_snapshot_frequency(config.database.checkpoint_delta.snapshot_frequency)
 
         app.state.stream_bridge = await stack.enter_async_context(make_stream_bridge(config))
 
@@ -405,14 +443,17 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
 
         app.state.thread_store = make_thread_store(sf, app.state.store)
         if sf is not None:
+            from deerflow.persistence.mcp_tasks import McpTaskRepository
             from deerflow.persistence.scheduled_task_runs import (
                 ScheduledTaskRunRepository,
             )
             from deerflow.persistence.scheduled_tasks import ScheduledTaskRepository
 
+            app.state.mcp_task_repo = McpTaskRepository(sf)
             app.state.scheduled_task_repo = ScheduledTaskRepository(sf)
             app.state.scheduled_task_run_repo = ScheduledTaskRunRepository(sf)
         else:
+            app.state.mcp_task_repo = None
             app.state.scheduled_task_repo = None
             app.state.scheduled_task_run_repo = None
 
@@ -448,6 +489,7 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
         app.state.run_manager = RunManager(
             store=app.state.run_store,
             run_ownership_config=run_ownership_config,
+            event_store=app.state.run_event_store,
             on_orphans_recovered=terminalize_recovered_runs,
         )
         # Startup recovery: mark inflight runs whose lease has expired as error.
@@ -565,6 +607,20 @@ def get_scheduled_task_service(request: Request):
     return val
 
 
+def get_mcp_task_repo(request: Request):
+    val = getattr(request.app.state, "mcp_task_repo", None)
+    if val is None:
+        raise HTTPException(status_code=503, detail="MCP task repo not available")
+    return val
+
+
+def get_mcp_task_service(request: Request):
+    val = getattr(request.app.state, "mcp_task_service", None)
+    if val is None:
+        raise HTTPException(status_code=503, detail="MCP task service not available")
+    return val
+
+
 def get_run_context(request: Request) -> RunContext:
     """Build a :class:`RunContext` from ``app.state`` singletons.
 
@@ -581,8 +637,10 @@ def get_run_context(request: Request) -> RunContext:
         event_store=get_run_event_store(request),
         run_events_config=getattr(request.app.state, "run_events_config", None),
         checkpoint_channel_mode=getattr(request.app.state, "checkpoint_channel_mode", "full"),
+        checkpoint_snapshot_frequency=getattr(request.app.state, "checkpoint_snapshot_frequency", None),
         thread_store=get_thread_store(request),
         app_config=get_config(),
+        extensions=getattr(request.app.state, "extensions", None),
         on_run_completed=getattr(request.app.state, "scheduled_task_service", None).handle_run_completion if getattr(request.app.state, "scheduled_task_service", None) is not None else None,
     )
 
