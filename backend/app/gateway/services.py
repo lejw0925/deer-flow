@@ -487,8 +487,20 @@ def resolve_agent_factory(assistant_id: str | None):
 # call), enabling runaway API cost / DoS. ``_DEFAULT_RECURSION_LIMIT`` is the
 # server default when the client sends nothing; the hard ceiling any client
 # value is clamped to is configurable via ``AppConfig.max_recursion_limit``.
-_DEFAULT_RECURSION_LIMIT = 100
 _DEFAULT_MAX_RECURSION_LIMIT = 1000
+
+
+def _resolve_default_recursion_limit() -> int:
+    """Resolve the default recursion limit from ``AppConfig``.
+
+    Uses ``config.yaml``'s ``max_recursion_limit`` as the source and returns
+    half of it as the default, clamped to at least 100 and at most 500.
+    Falls back to 100 when the app config cannot be loaded.
+    """
+    try:
+        return max(100, min(get_app_config().max_recursion_limit // 2, 500))
+    except Exception:
+        return 100
 
 
 def _resolve_max_recursion_limit() -> int:
@@ -508,11 +520,11 @@ def _clamp_recursion_limit(value: Any, max_limit: int) -> int:
     """Clamp a client-supplied ``recursion_limit`` into a safe server range.
 
     Non-integer values (including ``bool``, an ``int`` subclass) and non-positive
-    values fall back to ``_DEFAULT_RECURSION_LIMIT``; valid positive integers are
-    capped at ``max_limit`` (from ``AppConfig.max_recursion_limit``).
+    values fall back to ``_resolve_default_recursion_limit()``; valid positive
+    integers are capped at ``max_limit`` (from ``AppConfig.max_recursion_limit``).
     """
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return _DEFAULT_RECURSION_LIMIT
+        return _resolve_default_recursion_limit()
     return min(value, max_limit)
 
 
@@ -543,9 +555,9 @@ def build_run_config(
     # Lead-agent recursion budget (LangGraph super-steps for the lead graph
     # only). Independent of subagent depth: a `task()` dispatch runs the whole
     # subagent inside ONE lead tools-node step, and subagents enforce their own
-    # limit via `subagents.max_turns`. Do not conflate this 100 with the
-    # general-purpose subagent's max_turns.
-    config: dict[str, Any] = {"recursion_limit": _DEFAULT_RECURSION_LIMIT}
+    # limit via `subagents.max_turns`. Default is derived from
+    # ``AppConfig.max_recursion_limit`` (half, 100-500 range).
+    config: dict[str, Any] = {"recursion_limit": _resolve_default_recursion_limit()}
     if request_config:
         # LangGraph >= 0.6.0 introduced ``context`` as the preferred way to
         # pass thread-level data and rejects requests that include both

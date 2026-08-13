@@ -344,23 +344,30 @@ async def console_runs(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     status: str | None = Query(default=None, description="Filter by run status (e.g. running, success, error)"),
+    assistant_id: str | None = Query(default=None, description="Filter by assistant/agent id"),
 ) -> ConsoleRunsResponse:
     """Return a page of the user's runs across all threads."""
     sf = _session_factory_or_503()
     user_id = await get_current_user(request)
 
+    filters = [RunRow.operation_kind == "run"]
+    if user_id:
+        filters.append(RunRow.user_id == user_id)
+    if status:
+        filters.append(RunRow.status == status)
+    if assistant_id:
+        filters.append(RunRow.assistant_id == assistant_id)
+
+    # Apply all filters before LIMIT/OFFSET so an agent-specific history page
+    # cannot skip matching rows because unrelated runs occupied the page.
     stmt = (
         select(RunRow, ThreadMetaRow.display_name)
         .join(ThreadMetaRow, ThreadMetaRow.thread_id == RunRow.thread_id, isouter=True)
-        .where(RunRow.operation_kind == "run")
+        .where(*filters)
         .order_by(RunRow.created_at.desc(), RunRow.run_id.desc())
         .limit(limit + 1)
         .offset(offset)
     )
-    if user_id:
-        stmt = stmt.where(RunRow.user_id == user_id)
-    if status:
-        stmt = stmt.where(RunRow.status == status)
 
     async with sf() as session:
         rows = (await session.execute(stmt)).all()

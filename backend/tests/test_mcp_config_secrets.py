@@ -28,6 +28,7 @@ from app.gateway.routers.mcp import (
     update_mcp_configuration,
 )
 from deerflow.config.extensions_config import ExtensionsConfig
+from deerflow.tools.mcp_metadata import tag_mcp_tool
 
 # ---------------------------------------------------------------------------
 # _mask_server_config
@@ -387,6 +388,66 @@ def _request_with_role(system_role: str):
             )
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_discovery_returns_only_tagged_runtime_capabilities(monkeypatch):
+    async def authenticated(_request):
+        return SimpleNamespace(id="user-1")
+
+    class Tool:
+        def __init__(self, name: str, description: str, metadata=None):
+            self.name = name
+            self.description = description
+            self.metadata = metadata or {}
+
+    catalog_tool = tag_mcp_tool(
+        Tool("research_search", "Search verified sources."),
+        server_name="research",
+        original_name="search",
+    )
+    long_description_tool = tag_mcp_tool(
+        Tool("files_read", "x" * 1_200),
+        server_name="files",
+        original_name="read",
+    )
+
+    async def initialize_tools():
+        return [catalog_tool, Tool("local_helper", "Not MCP"), long_description_tool]
+
+    monkeypatch.setattr(mcp_router, "get_current_user_from_request", authenticated)
+    monkeypatch.setattr(mcp_router, "initialize_mcp_tools", initialize_tools)
+
+    response = await mcp_router.discover_mcp_tools(_request_with_role("user"))
+
+    assert [(tool.server_name, tool.name) for tool in response.tools] == [
+        ("files", "read"),
+        ("research", "search"),
+    ]
+    assert response.tools[1].description == "Search verified sources."
+    assert len(response.tools[0].description) == 1_000
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_discovery_requires_authenticated_user(monkeypatch):
+    initialized = False
+
+    async def unauthenticated(_request):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    async def initialize_tools():
+        nonlocal initialized
+        initialized = True
+        return []
+
+    monkeypatch.setattr(mcp_router, "get_current_user_from_request", unauthenticated)
+    monkeypatch.setattr(mcp_router, "initialize_mcp_tools", initialize_tools)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await mcp_router.discover_mcp_tools(_request_with_role("user"))
+
+    assert exc_info.value.status_code == 401
+    assert initialized is False
 
 
 @pytest.mark.asyncio

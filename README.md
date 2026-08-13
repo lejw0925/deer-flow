@@ -79,6 +79,7 @@ DeerFlow has newly integrated the intelligent search and crawling toolset indepe
   - [Recommended Models](#recommended-models)
   - [Embedded Python Client](#embedded-python-client)
   - [Scheduled Tasks](#scheduled-tasks)
+  - [Android Client](#android-client)
   - [Terminal Workbench (TUI)](#terminal-workbench-tui)
   - [Documentation](#documentation)
   - [⚠️ Security Notice](#️-security-notice)
@@ -184,6 +185,8 @@ That prompt is intended for coding agents. It tells the agent to clone the repo 
    For vLLM 0.19.0, use `deerflow.models.vllm_provider:VllmChatModel`. For Qwen-style reasoning models, DeerFlow toggles reasoning with `extra_body.chat_template_kwargs.enable_thinking` and preserves vLLM's non-standard `reasoning` field across multi-turn tool-call conversations. Legacy `thinking` configs are normalized automatically for backward compatibility. Reasoning models may also require the server to be started with `--reasoning-parser ...`. If your local vLLM deployment accepts any non-empty API key, you can still set `VLLM_API_KEY` to a placeholder value.
 
    MiMo reasoning models need `deerflow.models.patched_mimo:PatchedMimoChatModel` instead of plain `langchain_openai:ChatOpenAI`. MiMo returns assistant-side `reasoning_content` and expects that field to be echoed back on later turns when thinking is enabled, so the patched adapter preserves it across multi-turn agent runs.
+
+   [Kimi Code](https://www.kimi.com/code/docs/kimi-code/models.html) models use the Anthropic-compatible endpoint `https://api.kimi.com/coding`. Configure `k3` or `k3-256k` with `langchain_anthropic:ChatAnthropic`, `anthropic_api_key: $MOONSHOT_API_KEY`, and `supports_reasoning_effort: true`; DeerFlow normalizes its generic `minimal`, `medium`, and `xhigh` effort aliases to Kimi's `low`, `high`, and `max` values. `kimi-for-coding` and `kimi-for-coding-highspeed` use the same endpoint with thinking enabled.
 
    CLI-backed provider examples:
 
@@ -372,6 +375,7 @@ DeerFlow supports configurable MCP servers and skills to extend its capabilities
 For HTTP/SSE MCP servers, OAuth token flows are supported (`client_credentials`, `refresh_token`).
 For stdio MCP servers, per-tool call timeouts can be configured with `tool_call_timeout`.
 MCP routing hints can also prefer a specific MCP tool for matching requests without forbidding other tools. When `tool_search` defers MCP schemas, matching routing metadata can auto-promote up to `tool_search.auto_promote_top_k` deferred schemas before the model call.
+Authenticated clients can read a discovery-only catalog of MCP tools at `GET /api/mcp/tools`; server configuration and cache resets remain administrator-only.
 See the [MCP Server Guide](backend/docs/MCP_SERVER.md) for detailed instructions.
 
 #### IM Channels
@@ -732,7 +736,7 @@ than a green status hiding a later `command not found`.
 
 If a trusted operator manages the configured skills directory through an external mount such as MinIO, NFS, or CSI, an administrator can call `POST /api/skills/reload` after changing files. This invalidates skill prompt caches for the current Gateway process and waits up to the bounded refresh timeout so subsequent runs rescan the latest files; running tasks are unchanged. A loader-level filesystem failure returns a generic server error and preserves the last successfully loaded process cache rather than publishing an empty catalog. Uvicorn workers and Kubernetes Pods must each be targeted separately. Direct mount writes bypass the validation, SkillScan, and history applied by DeerFlow's install/edit APIs, so only operator-controlled systems should have write access.
 
-Skill installs and agent-managed skill edits run through **SkillScan**, a native deterministic safety scanner before the LLM-based skill scanner. Phase 1 runs offline with no Semgrep/OpenGrep dependency, blocks high-confidence `CRITICAL` findings such as private keys or shell execution, and passes warning findings to the LLM scanner for contextual review. Python instance-client exfiltration checks follow a minimal same-scope evidence chain: a simple name bound to a known client constructor, optional name-to-name aliases, and an actual outbound method or context-manager use supported by that constructor. Constructor roots must be proven imports; bare canonical-looking names are not inferred as modules. Nested scopes do not inherit client handles and inherit only constructor import aliases that are never rebound in the enclosing scope. Comprehensions, walrus-bearing statements, annotations, complex binding targets, unsupported operations, and ambiguous branch flows produce no finding from this signal; skipped constructs conservatively invalidate every name they may bind so stale client state cannot create a finding. A deterministic work budget or recursion limit reached by this best-effort analysis does not discard findings already collected for the file. Set `skill_scan.enabled: false` in `config.yaml` to disable only the deterministic analyzers; safe archive extraction and the LLM scanner still run.
+Skill installs and agent-managed skill edits run through **SkillScan**, a native deterministic safety scanner before the LLM-based skill scanner. Phase 1 runs offline with no Semgrep/OpenGrep dependency, blocks high-confidence `CRITICAL` findings such as private keys or shell execution, and passes warning findings to the LLM scanner for contextual review. Python instance-client exfiltration checks follow a minimal same-scope evidence chain: a simple name bound to a known client constructor, optional name-to-name aliases, and an actual outbound method or context-manager use supported by that constructor. Constructor roots must be proven imports; bare canonical-looking names are not inferred as modules. Nested scopes do not inherit client handles and inherit only constructor import aliases that are never rebound in the enclosing scope. Comprehensions, walrus-bearing statements, annotations, complex binding targets, unsupported operations, and ambiguous branch flows produce no finding from this signal; skipped constructs conservatively invalidate every name they may bind so stale client state cannot create a finding. A deterministic work budget or recursion limit reached by this best-effort analysis does not discard findings already collected for the file. Set `skill_scan.enabled: false` in `config.yaml` to skip native and LLM content scanners during `.skill` archive installation; safe archive extraction, frontmatter validation, and package structure checks still run. For skill edits and agent-managed writes, it disables only the deterministic analyzers; LLM moderation continues to run.
 
 DeerFlow also ships with **skill-reviewer**, a public skill for read-only skill quality review. It uses the built-in `review_skill_package` tool to inspect installed skills, local packages, archives, or pasted `SKILL.md` content without activating the target skill, binding its secrets, executing its scripts, or installing it. The tool returns a compact, tag-neutralized JSON payload to the model context and keeps the full raw review payload in the tool artifact for programmatic consumers. The deterministic review core reuses DeerFlow parsing and SkillScan facts, emits versioned JSON contracts under `contracts/skill_review/`, and can be run from the backend CLI:
 
@@ -895,7 +899,7 @@ uv sync --extra browser
 uv run playwright install chromium
 ```
 
-Then uncomment the `group: browser` tool entries in `config.yaml` (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_get_text`, `browser_back`, `browser_screenshot`, `browser_close`). `make dev` / Docker startup detects an enabled `browser_navigate` tool and preserves the `browser` extra on dependency syncs. The Gateway fails startup if browser control is configured but Playwright is missing, and `/api/features` hides the Browser UI unless the backend can actually serve it. Keep `headless: true` and `allow_private_addresses: false` for anything but local, trusted debugging. Attaching to an existing Chrome with `cdp_url` cannot enforce DeerFlow's subresource/redirect SSRF guard and therefore fails closed unless `allow_unguarded_cdp: true` explicitly acknowledges that risk; use it only with a trusted local browser. Browser sessions are process-local; keep `GATEWAY_WORKERS=1` while this tool group is enabled because ordinary uvicorn worker dispatch does not provide thread affinity.
+Then uncomment the `group: browser` tool entries in `config.yaml` (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_get_text`, `browser_back`, `browser_screenshot`, `browser_close`). `make dev` detects an enabled `browser_navigate` tool and preserves the `browser` extra on dependency syncs. `make up` also detects it and builds a Gateway image with Chromium and its required system libraries. The Gateway fails startup if browser control is configured but Playwright is missing, and `/api/features` hides the Browser UI unless the backend can actually serve it. Keep `headless: true` and `allow_private_addresses: false` for anything but local, trusted debugging. Attaching to an existing Chrome with `cdp_url` cannot enforce DeerFlow's subresource/redirect SSRF guard and therefore fails closed unless `allow_unguarded_cdp: true` explicitly acknowledges that risk; use it only with a trusted local browser. Browser sessions are process-local; keep `GATEWAY_WORKERS=1` while this tool group is enabled because ordinary uvicorn worker dispatch does not provide thread affinity.
 
 ### Context Engineering
 
@@ -998,6 +1002,40 @@ Current MVP limits:
 - No `interval` schedule type in this first cut
 
 Enable background polling with `config.yaml -> scheduler.enabled`. Manual trigger uses the same scheduled-task resource and execution path.
+
+## Android Client
+
+The native Kotlin and Jetpack Compose client in [`android/`](android/) connects
+to the existing DeerFlow Gateway. It supports local-account authentication,
+Gateway-configured OIDC SSO through a secure native WebView, auth-disabled
+deployments, responsive phone/tablet navigation, cached drafts
+and structured message history, file uploads, resumable background runs, custom
+Agents with server-scoped defaults, native detail views, and server-filtered
+execution history with direct conversation navigation, and scheduled-task
+management for recurring `cron` and one-time `once` work with per-run history,
+execution details, and conversation-output navigation without requiring an
+Android-specific backend. Its native Memory
+workspace supports search, summaries, fact create/edit/delete, clear
+confirmation, and server-scoped Room fallback while offline. The client also
+lists Gateway Channel providers, lets users start their binding flow, and lets
+administrators manage each provider's runtime credentials and enabled state.
+Profile settings provide explicit language selection, terminal notification
+preferences, cache statistics/retention/clearing, and About/license details.
+Its Composer capability panel makes automatic Memory status and the
+authenticated MCP tool catalog visible before a run; administrators can also
+manage MCP server state and full masked configuration from the native client.
+The safe MCP tool catalog has a server-scoped Room fallback for offline
+capability inspection. Native tool activity presents structured Web sources,
+image-result tiles, file entries/content, and separate shell command/output
+instead of a generic raw-result block.
+
+```bash
+cd android
+./gradlew testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
+```
+
+See the [Android client guide](android/README.md) for emulator networking,
+server configuration, security guidance, and the APK output path.
 
 ## Terminal Workbench (TUI)
 

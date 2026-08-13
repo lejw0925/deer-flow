@@ -20,11 +20,32 @@ from langchain.tools import BaseTool
 
 MCP_TOOL_METADATA_KEY = "deerflow_mcp"
 MCP_TOOL_ROUTING_METADATA_KEY = "deerflow_mcp_routing"
+MCP_TOOL_SERVER_METADATA_KEY = "deerflow_mcp_server"
+MCP_TOOL_ORIGINAL_NAME_METADATA_KEY = "deerflow_mcp_original_name"
 
 
-def tag_mcp_tool(tool: BaseTool) -> BaseTool:
-    """Mark ``tool`` as MCP-sourced. Mutates in place and returns it for chaining."""
-    tool.metadata = {**(tool.metadata or {}), MCP_TOOL_METADATA_KEY: True}
+def tag_mcp_tool(
+    tool: BaseTool,
+    *,
+    server_name: str | None = None,
+    original_name: str | None = None,
+) -> BaseTool:
+    """Mark ``tool`` as MCP-sourced and optionally retain its source identity.
+
+    Runtime consumers only need the MCP flag, while capability catalogs need a
+    stable server and pre-prefix tool name. Keeping both on the tool preserves
+    that identity through session-pool wrappers without exposing connection
+    configuration or credentials.
+    """
+    metadata: dict[str, Any] = {
+        **(tool.metadata or {}),
+        MCP_TOOL_METADATA_KEY: True,
+    }
+    if server_name:
+        metadata[MCP_TOOL_SERVER_METADATA_KEY] = server_name
+    if original_name:
+        metadata[MCP_TOOL_ORIGINAL_NAME_METADATA_KEY] = original_name
+    tool.metadata = metadata
     return tool
 
 

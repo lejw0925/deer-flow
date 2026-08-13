@@ -94,6 +94,16 @@ CMD ["sh", "-c", "cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app 
 # Clean image without build-essential — reduces size (~200 MB) and attack surface.
 FROM python:3.12-slim-bookworm
 
+ARG UV_EXTRAS
+ARG APT_MIRROR
+
+# Optionally override apt mirror for restricted networks (mirrors the builder
+# stage; without this the runtime apt steps below hit deb.debian.org directly).
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true; \
+    fi
+
 RUN apt-get update && apt-get install -y \
     libreoffice-writer-nogui \
     libreoffice-common \
@@ -103,6 +113,8 @@ RUN apt-get update && apt-get install -y \
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV PYTHONIOENCODING=utf-8
+# Keep downloaded browsers outside the virtualenv and available to the Gateway.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Copy Node.js runtime from builder (provides npx for MCP servers)
 COPY --from=builder /usr/bin/node /usr/bin/node
@@ -124,6 +136,17 @@ WORKDIR /app
 
 # Copy backend with pre-built virtualenv from builder
 COPY --from=builder /app/backend ./backend
+
+# Browser control is optional. The builder installs the Python package through
+# UV_EXTRAS; install Chromium and its Debian runtime libraries only when enabled.
+RUN set -eu; \
+    install_browser=false; \
+    for extra in $(printf "%s" "$UV_EXTRAS" | tr "," " "); do \
+        if [ "$extra" = "browser" ]; then install_browser=true; fi; \
+    done; \
+    if [ "$install_browser" = true ]; then \
+        cd backend && uv run --no-sync playwright install --with-deps chromium; \
+    fi
 
 # Expose Gateway API port.
 EXPOSE 8001

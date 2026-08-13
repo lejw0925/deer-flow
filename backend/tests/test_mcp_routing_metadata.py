@@ -9,7 +9,15 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
 from deerflow.config.extensions_config import ExtensionsConfig
-from deerflow.tools.mcp_metadata import MCP_TOOL_METADATA_KEY, MCP_TOOL_ROUTING_METADATA_KEY, get_mcp_routing, tag_mcp_routing, tag_mcp_tool
+from deerflow.tools.mcp_metadata import (
+    MCP_TOOL_METADATA_KEY,
+    MCP_TOOL_ORIGINAL_NAME_METADATA_KEY,
+    MCP_TOOL_ROUTING_METADATA_KEY,
+    MCP_TOOL_SERVER_METADATA_KEY,
+    get_mcp_routing,
+    tag_mcp_routing,
+    tag_mcp_tool,
+)
 
 
 class _Args(BaseModel):
@@ -43,6 +51,18 @@ def test_tag_mcp_routing_preserves_existing_mcp_flag():
     assert tagged.metadata[MCP_TOOL_METADATA_KEY] is True
     assert tagged.metadata[MCP_TOOL_ROUTING_METADATA_KEY]["priority"] == 80
     assert get_mcp_routing(tagged)["keywords"] == ["订单"]
+
+
+def test_tag_mcp_tool_preserves_source_identity_for_capability_catalogs():
+    tagged = tag_mcp_tool(
+        _tool("postgres_query"),
+        server_name="postgres",
+        original_name="query",
+    )
+
+    assert tagged.metadata[MCP_TOOL_METADATA_KEY] is True
+    assert tagged.metadata[MCP_TOOL_SERVER_METADATA_KEY] == "postgres"
+    assert tagged.metadata[MCP_TOOL_ORIGINAL_NAME_METADATA_KEY] == "query"
 
 
 def test_get_mcp_routing_returns_none_for_non_mcp_tools():
@@ -120,3 +140,5 @@ async def test_get_mcp_tools_tags_effective_routing_metadata(transport: str):
     assert routing is not None
     assert routing["priority"] == 100
     assert routing["keywords"] == ["查库"]
+    assert tools[0].metadata[MCP_TOOL_SERVER_METADATA_KEY] == "postgres"
+    assert tools[0].metadata[MCP_TOOL_ORIGINAL_NAME_METADATA_KEY] == "query"

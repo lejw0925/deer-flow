@@ -165,6 +165,15 @@ def test_detect_from_config_browser_via_indentless_tools_list(tmp_path):
     assert detect.detect_from_config(cfg) == ["browser"]
 
 
+def test_detect_from_config_browser_via_top_level_browser_navigate_tool(tmp_path):
+    """The normal config shape puts list items at the YAML document margin."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "tools:\n- name: browser_navigate\n  group: browser\n  use: deerflow.community.browser_automation.tools:browser_navigate_tool\n",
+    )
+    assert detect.detect_from_config(cfg) == ["browser"]
+
+
 def test_detect_from_config_ignores_commented_browser_tool(tmp_path):
     cfg = tmp_path / "config.yaml"
     cfg.write_text(

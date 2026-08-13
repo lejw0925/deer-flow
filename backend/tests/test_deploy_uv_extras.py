@@ -92,6 +92,17 @@ def test_backend_dockerfile_rejects_glob_uv_extra(tmp_path):
     assert not capture.exists()
 
 
+def test_backend_dockerfile_installs_chromium_when_browser_extra_is_enabled():
+    """Production browser control needs the Playwright browser, not only its wheel."""
+    dockerfile = (REPO_ROOT / "backend" / "Dockerfile").read_text(encoding="utf-8")
+    runtime = dockerfile.rsplit("FROM python:3.12-slim-bookworm", maxsplit=1)[1]
+
+    assert "ARG UV_EXTRAS" in runtime
+    assert "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright" in runtime
+    assert '[ "$extra" = "browser" ]' in runtime
+    assert "playwright install --with-deps chromium" in runtime
+
+
 def test_deploy_build_auto_detects_postgres_extra_when_other_extras_are_enabled(tmp_path):
     """Production image builds preserve every detected extra as Docker build tokens."""
     worktree = tmp_path / "repo"
@@ -116,6 +127,7 @@ def test_deploy_build_auto_detects_postgres_extra_when_other_extras_are_enabled(
 
     env = os.environ.copy()
     env.pop("UV_EXTRAS", None)
+    env.pop("DEER_FLOW_CONFIG_PATH", None)
     env["CAPTURE_UV_EXTRAS"] = str(capture)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
 
@@ -214,6 +226,7 @@ def test_deploy_build_auto_detects_postgres_extra_with_python_fallback(tmp_path)
 
     env = os.environ.copy()
     env.pop("UV_EXTRAS", None)
+    env.pop("DEER_FLOW_CONFIG_PATH", None)
     env["CAPTURE_UV_EXTRAS"] = str(capture)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
 

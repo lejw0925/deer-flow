@@ -467,6 +467,38 @@ def test_reasoning_effort_preserved_when_supported(monkeypatch):
     assert captured.get("reasoning_effort") == "minimal"
 
 
+@pytest.mark.parametrize(
+    ("model_id", "input_effort", "expected_effort"),
+    [
+        ("k3", "minimal", "low"),
+        ("k3", "medium", "high"),
+        ("k3", "xhigh", "max"),
+        ("k3-256k", "ultra", "max"),
+    ],
+)
+def test_kimi_code_k3_normalizes_reasoning_effort(monkeypatch, model_id, input_effort, expected_effort):
+    """Kimi Code K3 accepts low, high, and max rather than DeerFlow aliases."""
+    from langchain_anthropic import ChatAnthropic
+
+    cfg = _make_app_config(
+        [
+            _make_model(
+                model_id,
+                use="langchain_anthropic:ChatAnthropic",
+                supports_thinking=True,
+                supports_reasoning_effort=True,
+            )
+        ]
+    )
+    captured: dict = {}
+    _patch_factory(monkeypatch, cfg, model_class=_capturing_class(ChatAnthropic, captured))
+
+    factory_module.create_chat_model(name=model_id, reasoning_effort=input_effort)
+
+    assert captured.get("model_kwargs") == {"reasoning_effort": expected_effort}
+    assert "reasoning_effort" not in captured
+
+
 # ---------------------------------------------------------------------------
 # thinking shortcut field
 # ---------------------------------------------------------------------------

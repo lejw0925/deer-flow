@@ -2,7 +2,7 @@
 
 Covers:
 1. /api/console/stats — headline counters
-2. /api/console/runs — cross-thread listing, thread-title join, pagination, status filter
+2. /api/console/runs — cross-thread listing, thread-title join, pagination, status and assistant filters
 3. /api/console/usage — daily zero-filled buckets + per-model breakdown (incl. legacy fallback)
 4. user scoping — rows filtered when the request resolves to a user
 5. 503 when no SQL session factory is available (memory backend)
@@ -63,6 +63,7 @@ def _seed_rows() -> tuple[list[ThreadMetaRow], list[RunRow]]:
             run_id="r1",
             thread_id="t1",
             user_id="user-a",
+            assistant_id="researcher",
             status="success",
             model_name="minimax-m2",
             total_tokens=1200,
@@ -77,6 +78,7 @@ def _seed_rows() -> tuple[list[ThreadMetaRow], list[RunRow]]:
             run_id="r2",
             thread_id="t1",
             user_id="user-a",
+            assistant_id="researcher",
             status="running",
             model_name="minimax-m2",
             total_tokens=300,
@@ -91,6 +93,7 @@ def _seed_rows() -> tuple[list[ThreadMetaRow], list[RunRow]]:
             run_id="r3",
             thread_id="t2",
             user_id="user-a",
+            assistant_id="writer",
             status="error",
             model_name="gpt-x",
             error="Boom: provider exploded",
@@ -106,6 +109,7 @@ def _seed_rows() -> tuple[list[ThreadMetaRow], list[RunRow]]:
             run_id="r4",
             thread_id="t2",
             user_id="user-a",
+            assistant_id="researcher",
             status="success",
             model_name="minimax-m2",
             total_tokens=999,
@@ -117,6 +121,7 @@ def _seed_rows() -> tuple[list[ThreadMetaRow], list[RunRow]]:
             run_id="r5",
             thread_id="t3",  # no threads_meta row → exercises the outer join
             user_id="user-b",
+            assistant_id="researcher",
             status="success",
             model_name="qwen",
             total_tokens=70,
@@ -214,6 +219,21 @@ class TestConsoleRuns:
         assert [r["run_id"] for r in data["runs"]] == ["r3"]
         assert data["runs"][0]["error"].startswith("Boom")
 
+    def test_assistant_filter_applies_before_pagination(self, client):
+        first_page = client.get(
+            "/api/console/runs",
+            params={"assistant_id": "researcher", "limit": 2},
+        ).json()
+        assert [r["run_id"] for r in first_page["runs"]] == ["r2", "r1"]
+        assert first_page["has_more"] is True
+
+        second_page = client.get(
+            "/api/console/runs",
+            params={"assistant_id": "researcher", "limit": 2, "offset": 2},
+        ).json()
+        assert [r["run_id"] for r in second_page["runs"]] == ["r5", "r4"]
+        assert second_page["has_more"] is False
+
 
 class TestConsoleUsage:
     def test_daily_buckets_and_model_breakdown(self, client):
@@ -308,6 +328,11 @@ class TestUserScoping:
         assert stats["total_tokens"] == 1200 + 300 + 50 + 999
         runs = client.get("/api/console/runs", params={"limit": 50}).json()
         assert all(r["run_id"] != "r5" for r in runs["runs"])
+        agent_runs = client.get(
+            "/api/console/runs",
+            params={"assistant_id": "researcher", "limit": 50},
+        ).json()
+        assert [r["run_id"] for r in agent_runs["runs"]] == ["r2", "r1", "r4"]
         usage = client.get("/api/console/usage").json()
         assert "qwen" not in usage["by_model"]
 

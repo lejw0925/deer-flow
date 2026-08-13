@@ -156,6 +156,8 @@ class LocalSkillStorage(SkillStorage):
 
         from deerflow.skills.installer import (
             SkillAlreadyExistsError,
+            SkillSecurityScanError,
+            _find_nested_skill_markdown,
             resolve_skill_dir_from_archive,
             safe_extract_skill_archive,
             scan_archive_preflight_or_raise,
@@ -189,6 +191,10 @@ class LocalSkillStorage(SkillStorage):
             raise ValueError(f"Invalid skill: {message}")
         if not skill_name or "/" in skill_name or "\\" in skill_name or ".." in skill_name:
             raise ValueError(f"Invalid skill name: {skill_name}")
+        nested_skill_md = _find_nested_skill_markdown(skill_dir)
+        if nested_skill_md is not None:
+            rel_path = nested_skill_md.relative_to(skill_dir).as_posix()
+            raise SkillSecurityScanError(f"Security scan failed for skill '{skill_name}': nested SKILL.md is not allowed at {skill_name}/{rel_path}")
 
         target = custom_dir / skill_name
         if target.exists():

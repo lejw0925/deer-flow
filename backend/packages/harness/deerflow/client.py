@@ -117,6 +117,19 @@ class StreamEvent:
     data: dict[str, Any] = field(default_factory=dict)
 
 
+def _resolve_default_recursion_limit() -> int:
+    """Resolve the default recursion limit from ``AppConfig``.
+
+    Uses ``config.yaml``'s ``max_recursion_limit`` as the source and returns
+    half of it as the default, clamped to at least 100 and at most 500.
+    Falls back to 100 when the app config cannot be loaded.
+    """
+    try:
+        return max(100, min(get_app_config().max_recursion_limit // 2, 500))
+    except Exception:
+        return 100
+
+
 class DeerFlowClient:
     """Embedded Python client for DeerFlow agent system.
 
@@ -253,7 +266,7 @@ class DeerFlowClient:
         }
         return RunnableConfig(
             configurable=configurable,
-            recursion_limit=overrides.get("recursion_limit", 100),
+            recursion_limit=overrides.get("recursion_limit", _resolve_default_recursion_limit()),
         )
 
     def _ensure_agent(self, config: RunnableConfig, *, context: Mapping[str, Any] | None = None):

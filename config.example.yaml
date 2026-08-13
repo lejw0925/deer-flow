@@ -1507,13 +1507,14 @@ skills:
 # ============================================================================
 # SkillScan Configuration
 # ============================================================================
-# Native deterministic skill safety scanning. This runs before the LLM skill
-# scanner on skill install/update and agent-managed skill writes.
+# Skill safety scanning for skill archive installs and agent-managed skill writes.
 skill_scan:
-  # Set false to disable the new deterministic analyzers (nested-archive,
-  # secret-pattern, and other content-level checks). Safe archive extraction
-  # (path traversal, symlinks, executable-binary, total-size, and entry-count
-  # limits) and the LLM skill scanner still run unconditionally.
+  # Set false to skip native and LLM content scanners during .skill archive
+  # installation. Safe archive extraction (path traversal, symlinks,
+  # executable-binary, total-size, and entry-count limits), frontmatter
+  # validation, and package structure checks still run.
+  # For edits and agent-managed skill writes, false disables native analyzers
+  # only; LLM moderation continues to run.
   enabled: true
 
 # Note: To restrict which skills are loaded for a specific custom agent,

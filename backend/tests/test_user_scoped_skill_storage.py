@@ -294,6 +294,21 @@ class TestPathSafety:
         with pytest.raises(ValueError, match="empty"):
             user_storage.write_custom_skill("demo-skill", "", "x")
 
+    def test_get_user_integrations_root_and_validation(self, user_storage: UserScopedSkillStorage):
+        """Regression: get_user_integrations_root() must not raise AttributeError.
+
+        The getter and validate_skill_file_path() used to reference
+        ``self._user_integrations_root`` while __init__ only defined
+        ``self._integrations_root``, breaking every agent LLM call that
+        activates a skill ("LLM request failed: 'UserScopedSkillStorage'
+        object has no attribute '_user_integrations_root'").
+        """
+        root = user_storage.get_user_integrations_root()
+        assert root is not None
+        skill_file = root / "lark-cli" / "SKILL.md"
+        assert user_storage.validate_skill_file_path(skill_file) == skill_file.resolve()
+
+
 
 class TestFactory:
     """get_or_new_user_skill_storage factory behavior."""

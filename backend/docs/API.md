@@ -305,7 +305,70 @@ GET /api/models/{model_name}
 }
 ```
 
+### Operations Console
+
+#### List Runs Across Threads
+
+List the current user's recorded runs across all threads, newest first. The
+optional `assistant_id` query parameter narrows the result to one assistant or
+custom agent; filtering is applied on the server before pagination.
+
+```http
+GET /api/console/runs?assistant_id=researcher&limit=20&offset=0&status=success
+```
+
+The endpoint requires a SQL database backend. It returns `503` when the
+configured persistence backend is `memory`.
+
+**Response:**
+```json
+{
+  "runs": [
+    {
+      "run_id": "run123",
+      "thread_id": "thread123",
+      "thread_title": "Research notes",
+      "assistant_id": "researcher",
+      "status": "success",
+      "model_name": "gpt-4o",
+      "created_at": "2024-01-15T10:30:00Z",
+      "updated_at": "2024-01-15T10:31:12Z",
+      "duration_seconds": 72.0,
+      "total_tokens": 1200,
+      "message_count": 4,
+      "cost": null,
+      "error": null
+    }
+  ],
+  "has_more": false
+}
+```
+
 ### MCP Configuration
+
+#### List Available MCP Tools
+
+Get a read-only catalog of tools currently loaded by the Gateway. Any
+authenticated user may use this endpoint to inspect available capabilities;
+it never returns server connection configuration, headers, environment values,
+or OAuth secrets.
+
+```http
+GET /api/mcp/tools
+```
+
+**Response:**
+```json
+{
+  "tools": [
+    {
+      "server_name": "github",
+      "name": "search_repositories",
+      "description": "Search repositories visible to the configured GitHub MCP server."
+    }
+  ]
+}
+```
 
 #### Get MCP Config
 

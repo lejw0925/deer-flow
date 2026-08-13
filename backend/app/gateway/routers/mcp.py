@@ -9,9 +9,14 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.gateway.deps import require_admin_user
+from app.gateway.deps import get_current_user_from_request, require_admin_user
 from deerflow.config.extensions_config import ExtensionsConfig, McpRoutingConfig, McpToolOverride, get_extensions_config, reload_extensions_config
-from deerflow.mcp.cache import reset_mcp_tools_cache
+from deerflow.mcp.cache import initialize_mcp_tools, reset_mcp_tools_cache
+from deerflow.tools.mcp_metadata import (
+    MCP_TOOL_ORIGINAL_NAME_METADATA_KEY,
+    MCP_TOOL_SERVER_METADATA_KEY,
+    is_mcp_tool,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["mcp"])
@@ -28,6 +33,8 @@ _ADMIN_REQUIRED_DETAIL = "Admin privileges required to manage MCP configuration.
 _MCP_STDIO_COMMAND_ALLOWLIST_ENV = "DEER_FLOW_MCP_STDIO_COMMAND_ALLOWLIST"
 _DEFAULT_MCP_STDIO_COMMAND_ALLOWLIST = frozenset({"npx", "uvx"})
 _SHELL_METACHARS = frozenset(";|&`$<>\n\r")
+_MCP_TOOL_DISCOVERY_TIMEOUT_SECONDS = 15
+_MAX_MCP_TOOL_DESCRIPTION_LENGTH = 1_000
 
 
 class McpOAuthConfigResponse(BaseModel):
@@ -83,6 +90,20 @@ class McpConfigUpdateRequest(BaseModel):
         ...,
         description="Map of MCP server name to configuration",
     )
+
+
+class McpDiscoveredToolResponse(BaseModel):
+    """Public capability details for one tool loaded from an MCP server."""
+
+    server_name: str = Field(description="Configured MCP server that provided this tool")
+    name: str = Field(description="Original tool name before DeerFlow's server prefix")
+    description: str = Field(default="", description="Tool-provided summary, capped for catalog responses")
+
+
+class McpToolDiscoveryResponse(BaseModel):
+    """Read-only catalog of tools currently available to the Gateway runtime."""
+
+    tools: list[McpDiscoveredToolResponse] = Field(default_factory=list)
 
 
 class McpCacheResetResponse(BaseModel):
@@ -300,6 +321,48 @@ def _merge_preserving_secrets(
         if key not in (incoming.model_extra or {}):
             update[key] = value
     return incoming.model_copy(update=update)
+
+
+@router.get(
+    "/mcp/tools",
+    response_model=McpToolDiscoveryResponse,
+    summary="List Available MCP Tools",
+    description=("Return the tool capabilities currently loaded from MCP servers. This authenticated, read-only catalog never exposes MCP connection configuration or secrets."),
+)
+async def discover_mcp_tools(request: Request) -> McpToolDiscoveryResponse:
+    """Return the safe, runtime-resolved MCP capability catalog for any user."""
+    await get_current_user_from_request(request)
+    try:
+        loaded_tools = await asyncio.wait_for(
+            initialize_mcp_tools(),
+            timeout=_MCP_TOOL_DISCOVERY_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        logger.warning("Timed out while discovering MCP tools for the capability catalog")
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Timed out while loading MCP tools. Try again shortly.",
+        ) from exc
+
+    tools: list[McpDiscoveredToolResponse] = []
+    for tool in loaded_tools:
+        if not is_mcp_tool(tool):
+            continue
+        metadata = getattr(tool, "metadata", None) or {}
+        server_name = metadata.get(MCP_TOOL_SERVER_METADATA_KEY)
+        original_name = metadata.get(MCP_TOOL_ORIGINAL_NAME_METADATA_KEY)
+        if not isinstance(server_name, str) or not server_name or not isinstance(original_name, str) or not original_name:
+            logger.warning("Skipping MCP tool without source metadata: %s", getattr(tool, "name", "<unnamed>"))
+            continue
+        description = str(getattr(tool, "description", "") or "")[:_MAX_MCP_TOOL_DESCRIPTION_LENGTH]
+        tools.append(
+            McpDiscoveredToolResponse(
+                server_name=server_name,
+                name=original_name,
+                description=description,
+            )
+        )
+    return McpToolDiscoveryResponse(tools=sorted(tools, key=lambda item: (item.server_name, item.name)))
 
 
 @router.get(

@@ -11,6 +11,50 @@ from deerflow.tracing import build_tracing_callbacks
 logger = logging.getLogger(__name__)
 
 
+_KIMI_CODE_K3_MODEL_IDS = frozenset({"k3", "k3-256k"})
+_KIMI_CODE_K3_REASONING_EFFORTS = {
+    "minimal": "low",
+    "minimum": "low",
+    "light": "low",
+    "medium": "high",
+    "ultra": "max",
+    "xhigh": "max",
+}
+
+
+def _normalize_kimi_code_k3_reasoning_effort(
+    model_id: str,
+    runtime_settings: dict,
+    configured_settings: dict,
+) -> None:
+    """Translate Kimi Code K3 effort aliases and pass them through ChatAnthropic."""
+    if model_id not in _KIMI_CODE_K3_MODEL_IDS:
+        return
+
+    runtime_effort = runtime_settings.pop("reasoning_effort", None)
+    configured_effort = configured_settings.pop("reasoning_effort", None)
+    raw_model_kwargs = configured_settings.get("model_kwargs")
+    if raw_model_kwargs is not None and not isinstance(raw_model_kwargs, dict):
+        # Preserve the provider's usual validation error for a malformed model_kwargs.
+        if runtime_effort is not None:
+            runtime_settings["reasoning_effort"] = runtime_effort
+        elif configured_effort is not None:
+            configured_settings["reasoning_effort"] = configured_effort
+        return
+
+    model_kwargs = dict(raw_model_kwargs or {})
+    effort = runtime_effort if runtime_effort is not None else configured_effort
+    if effort is None:
+        effort = model_kwargs.get("reasoning_effort")
+    if effort is None:
+        return
+
+    if isinstance(effort, str):
+        effort = _KIMI_CODE_K3_REASONING_EFFORTS.get(effort.casefold(), effort)
+    model_kwargs["reasoning_effort"] = effort
+    configured_settings["model_kwargs"] = model_kwargs
+
+
 def _deep_merge_dicts(base: dict | None, override: dict) -> dict:
     """Recursively merge two dictionaries without mutating the inputs."""
     merged = dict(base or {})
@@ -268,6 +312,11 @@ def create_chat_model(name: str | None = None, thinking_enabled: bool = False, *
     if not model_config.supports_reasoning_effort:
         kwargs.pop("reasoning_effort", None)
         model_settings_from_config.pop("reasoning_effort", None)
+    _normalize_kimi_code_k3_reasoning_effort(
+        model_config.model,
+        kwargs,
+        model_settings_from_config,
+    )
 
     # Normalize the api_base -> base_url alias FIRST, so the downstream OpenAI-compatible
     # heuristics (stream_usage default below / stream_chunk_timeout) see the canonical endpoint key.

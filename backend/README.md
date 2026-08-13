@@ -73,7 +73,7 @@ Per-thread isolated execution with virtual path translation:
 - **Virtual paths**: `/mnt/user-data/{workspace,uploads,outputs}` → thread-specific physical directories
 - **Skills path**: `/mnt/skills` → `deer-flow/skills/` directory
 - **Skills loading**: Recursively discovers nested `SKILL.md` files under `skills/{public,custom}` and preserves nested container paths
-- **SkillScan**: Native offline deterministic scanning runs before the LLM skill scanner on installs and agent-managed skill writes; `CRITICAL` findings block and warning findings become LLM context
+- **SkillScan**: Native offline deterministic scanning runs before the LLM skill scanner on installs and agent-managed skill writes; `CRITICAL` findings block and warning findings become LLM context. Set `skill_scan.enabled: false` to skip native and LLM content scanners during `.skill` archive installation while retaining archive and package validation; edits and agent-managed writes still retain LLM moderation.
 - **File-write safety**: `str_replace` serializes read-modify-write per `(sandbox.id, path)` so isolated sandboxes keep concurrency even when virtual paths match
 - **Tools**: `bash`, `ls`, `read_file`, `write_file`, `str_replace` (`write_file` overwrites by default and exposes `append` for end-of-file writes; `bash` is disabled by default when using `LocalSandboxProvider`; use `AioSandboxProvider` for isolated shell access)
 
@@ -114,6 +114,7 @@ FastAPI application providing REST endpoints for frontend integration:
 | Route | Purpose |
 |-------|---------|
 | `GET /api/models` | List available LLM models |
+| `GET /api/console/runs` | List cross-thread run history, optionally filtered by assistant/agent id |
 | `GET/PUT /api/mcp/config` | Manage MCP server configurations |
 | `POST /api/mcp/cache/reset` | Reset cached MCP tools so they reload on next use |
 | `GET/PUT /api/skills` | List and manage skills |

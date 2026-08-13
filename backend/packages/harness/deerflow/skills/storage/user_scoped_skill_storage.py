@@ -333,7 +333,7 @@ class UserScopedSkillStorage(LocalSkillStorage):
         try:
             skill_dir, skill_name, target = await asyncio.to_thread(self._prepare_skill_archive, path, Path(tmp), custom_dir, archive_path)
 
-            await _scan_skill_archive_contents_or_raise(skill_dir, skill_name)
+            await _scan_skill_archive_contents_or_raise(skill_dir, skill_name, app_config=self._app_config)
 
             await asyncio.to_thread(self._commit_skill_install, skill_dir, skill_name, custom_dir, target)
             logger.info("Skill %r installed to %s for user %s", skill_name, target, self._user_id)
@@ -387,7 +387,7 @@ class UserScopedSkillStorage(LocalSkillStorage):
 
     def get_user_integrations_root(self) -> Path:
         """Host path to this user's managed integration skills root directory."""
-        return self._user_integrations_root
+        return self._integrations_root
 
     # ------------------------------------------------------------------
     # Path validation — accept per-user custom root as well as global root
@@ -401,7 +401,7 @@ class UserScopedSkillStorage(LocalSkillStorage):
         would reject them.  This override allows both roots.
         """
         resolved_file = skill_file.resolve()
-        for allowed_root in (self._host_root.resolve(), self._user_custom_root.resolve(), self._user_integrations_root.resolve()):
+        for allowed_root in (self._host_root.resolve(), self._user_custom_root.resolve(), self._integrations_root.resolve()):
             try:
                 resolved_file.relative_to(allowed_root)
                 return resolved_file

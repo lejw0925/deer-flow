@@ -237,16 +237,16 @@ def tools_include_name(lines: list[str], tool_name: str) -> bool:
             continue
         if not inside:
             continue
-        name_match = _LIST_ITEM_NAME_RE.match(line)
-        if name_match:
-            if _unquote(name_match.group(1).strip()) == tool_name:
-                return True
-            continue
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
-        if indent == 0:
+        name_match = _LIST_ITEM_NAME_RE.match(line)
+        # A YAML sequence may start at the document margin directly below
+        # ``tools:``, so it is still part of the section at indent zero.
+        if indent == 0 and name_match is None:
             inside = False
             continue
+        if name_match and _unquote(name_match.group(1).strip()) == tool_name:
+            return True
     return False
 
 

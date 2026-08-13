@@ -21,6 +21,17 @@ def _stub_app_config():
     reset_app_config()
 
 
+@pytest.fixture
+def _missing_app_config(monkeypatch):
+    """Exercise config-load fallbacks without consulting a developer config.yaml."""
+    import app.gateway.services as services
+
+    def missing_app_config():
+        raise FileNotFoundError
+
+    monkeypatch.setattr(services, "get_app_config", missing_app_config)
+
+
 def _make_start_run_request(run_manager, *, thread_store=None, auth_source=None):
     from langgraph.checkpoint.memory import InMemorySaver
     from langgraph.store.memory import InMemoryStore
@@ -384,11 +395,12 @@ def test_normalize_input_handles_non_human_roles():
     assert result["messages"][2].tool_call_id == "call-1"
 
 
-def test_build_run_config_basic():
+def test_build_run_config_basic(_missing_app_config):
     from app.gateway.services import build_run_config
 
     config = build_run_config("thread-1", None, None)
     assert config["configurable"]["thread_id"] == "thread-1"
+    # A missing config falls back to 100.
     assert config["recursion_limit"] == 100
 
 
@@ -492,11 +504,12 @@ def test_build_run_config_preserves_reasonable_recursion_limit(_stub_app_config)
 
 def test_build_run_config_rejects_invalid_recursion_limit(_stub_app_config):
     """Non-positive / non-int / bool values fall back to the server default."""
-    from app.gateway.services import _DEFAULT_RECURSION_LIMIT, build_run_config
+    from app.gateway.services import _resolve_default_recursion_limit, build_run_config
 
+    default_limit = _resolve_default_recursion_limit()
     for bad in (0, -5, "1000", 3.5, True, None):
         config = build_run_config("thread-1", {"recursion_limit": bad}, None)
-        assert config["recursion_limit"] == _DEFAULT_RECURSION_LIMIT, bad
+        assert config["recursion_limit"] == default_limit, bad
 
 
 def test_build_run_config_clamps_recursion_limit_with_context(_stub_app_config):
@@ -1662,7 +1675,7 @@ def test_launch_scheduled_thread_run_marks_context_non_interactive(_stub_app_con
 # ---------------------------------------------------------------------------
 
 
-def test_build_run_config_with_context():
+def test_build_run_config_with_context(_missing_app_config):
     """When caller sends 'context', prefer it over 'configurable'."""
     from app.gateway.services import build_run_config
 

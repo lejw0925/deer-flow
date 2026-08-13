@@ -653,6 +653,7 @@ Lets a caller pass per-request, short-lived end-user credentials (e.g. an ERP to
 - `create_chat_model(name, thinking_enabled)` instantiates LLM from config via reflection
 - Supports `thinking_enabled` flag with per-model `when_thinking_enabled` overrides
 - Supports vLLM-style thinking toggles via `when_thinking_enabled.extra_body.chat_template_kwargs.enable_thinking` for Qwen reasoning models, while normalizing legacy `thinking` configs for backward compatibility
+- Normalizes DeerFlow's Kimi Code K3 effort aliases (`minimal` / `medium` / `xhigh`) to Kimi's `low` / `high` / `max` values before constructing the Anthropic-compatible client
 - Supports `supports_vision` flag for image understanding models
 - Config values starting with `$` resolved as environment variables
 - Missing provider modules surface actionable install hints from reflection resolvers (for example `uv add langchain-google-genai`)
@@ -995,6 +996,7 @@ Config is env-driven like the others — `MonocleTracingConfig`, built in `get_t
 - `sandbox.use` - Sandbox provider class path
 - `skills.path` / `skills.container_path` - Host and container paths to skills directory
 - `skills.deferred_discovery` - When `true`, replaces the full-metadata `<available_skills>` prompt block with a compact `<skill_index>` (names only) and registers the `describe_skill` tool so the agent fetches metadata on demand. Defaults to `false` (legacy full-metadata injection)
+- `skill_scan.enabled` - When `false`, skips native and LLM content scanners during `.skill` archive installation while retaining extraction and package validation; for edits and agent-managed writes it skips native analyzers only
 - `title` - Auto-title generation (enabled, max_words, max_chars, model_name; null model_name uses fast local fallback, explicit model_name uses the prompt_template LLM path)
 - `summarization` - Context summarization (enabled, trigger conditions, keep policy)
 - `subagents.enabled` - Master switch for subagent delegation

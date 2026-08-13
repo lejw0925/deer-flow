@@ -581,7 +581,7 @@ skill_scan:
   enabled: true
 ```
 
-Set `skill_scan.enabled: false` to disable only the deterministic analyzers. Safe archive extraction and the LLM-based skill scanner still run.
+Set `skill_scan.enabled: false` to skip native and LLM content scanners during `.skill` archive installation; safe archive extraction, frontmatter validation, and package structure checks still run. For edits and agent-managed writes, it disables only the deterministic analyzers; LLM moderation continues to run.
 
 **Per-Agent Skill Filtering**:
 Custom agents can restrict which skills they load by defining a `skills` field in their `config.yaml` (located at `workspace/agents/<agent_name>/config.yaml`):

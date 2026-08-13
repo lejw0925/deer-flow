@@ -306,19 +306,34 @@ def _collect_scannable_files(skill_dir: Path) -> list[Path]:
     return [candidate for candidate in sorted(skill_dir.rglob("*")) if candidate.is_file()]
 
 
+def _find_nested_skill_markdown(skill_dir: Path) -> Path | None:
+    """Return a nested ``SKILL.md`` path, if the package contains one."""
+    skill_md = skill_dir / "SKILL.md"
+    return next(
+        (path for path in skill_dir.rglob("SKILL.md") if path != skill_md),
+        None,
+    )
+
+
 async def _scan_skill_archive_contents_or_raise(skill_dir: Path, skill_name: str, *, app_config=None) -> list[StaticFinding]:
-    """Run the skill security scanner against all installable text and script files."""
-    static_findings = await _scan_static_skill_archive_or_raise(skill_dir, skill_name, app_config=app_config)
+    """Run install-time security scans against all installable text and script files.
+
+    Archive extraction, frontmatter validation, and package structure validation
+    happen before this function.
+    """
+    if not skill_scan_enabled(app_config):
+        logger.info("Skipping install-time security scans for skill %r because skill_scan.enabled=false", skill_name)
+        return []
 
     skill_md = skill_dir / "SKILL.md"
+    static_findings = await _scan_static_skill_archive_or_raise(skill_dir, skill_name, app_config=app_config)
     await _scan_skill_file_or_raise(skill_dir, skill_md, skill_name, executable=False, static_findings=_findings_for_file(static_findings, "SKILL.md"))
 
-    for path in await asyncio.to_thread(_collect_scannable_files, skill_dir):
+    scannable_files = await asyncio.to_thread(_collect_scannable_files, skill_dir)
+    for path in scannable_files:
         rel_path = path.relative_to(skill_dir)
         if rel_path == Path("SKILL.md"):
             continue
-        if path.name == "SKILL.md":
-            raise SkillSecurityScanError(f"Security scan failed for skill '{skill_name}': nested SKILL.md is not allowed at {skill_name}/{rel_path.as_posix()}")
         rel_path_posix = rel_path.as_posix()
         if await _is_code_file(path, rel_path):
             await _scan_skill_file_or_raise(
