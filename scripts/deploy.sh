@@ -386,19 +386,36 @@ echo ""
 
 # ── Start / Up ───────────────────────────────────────────────────────────────
 
+report_startup_failure() {
+    echo -e "${RED}✗ DeerFlow services failed to become ready.${NC}" >&2
+    echo '  If Docker Compose reports "unknown flag: --wait", upgrade to a version that' >&2
+    echo '  supports `docker compose up --wait`.' >&2
+    echo "  Container status:" >&2
+    "${COMPOSE_CMD[@]}" ps >&2 || true
+    echo "" >&2
+    echo "  Recent Gateway logs:" >&2
+    "${COMPOSE_CMD[@]}" logs --no-color --tail 100 gateway >&2 || true
+}
+
 if [ "$CMD" = "start" ]; then
     echo "Starting containers (no rebuild)..."
     echo ""
     # shellcheck disable=SC2086
-    "${COMPOSE_CMD[@]}" up -d --remove-orphans $services
-    sleep 3 && docker network connect bridge deer-flow-gateway 2>/dev/null || true
+    if ! "${COMPOSE_CMD[@]}" up -d --remove-orphans --wait --wait-timeout 180 $services; then
+        report_startup_failure
+        exit 1
+    fi
+    docker network connect bridge deer-flow-gateway 2>/dev/null || true
 else
     # Default: build + start
     echo "Building images and starting containers..."
     echo ""
     # shellcheck disable=SC2086
-    "${COMPOSE_CMD[@]}" up --build -d --remove-orphans $services
-    sleep 3 && docker network connect bridge deer-flow-gateway 2>/dev/null || true
+    if ! "${COMPOSE_CMD[@]}" up --build -d --remove-orphans --wait --wait-timeout 180 $services; then
+        report_startup_failure
+        exit 1
+    fi
+    docker network connect bridge deer-flow-gateway 2>/dev/null || true
 fi
 
 echo ""
