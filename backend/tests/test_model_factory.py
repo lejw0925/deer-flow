@@ -490,7 +490,11 @@ def test_reasoning_effort_preserved_when_supported(monkeypatch):
     ],
 )
 def test_kimi_code_k3_normalizes_reasoning_effort(monkeypatch, model_id, input_effort, expected_effort):
-    """Kimi Code K3 accepts low, high, and max rather than DeerFlow aliases."""
+    """Kimi Code K3 accepts low, high, and max rather than DeerFlow aliases.
+
+    The anthropic SDK rejects unknown top-level kwargs, so the effort must be
+    nested under ``extra_body`` to reach the request payload.
+    """
     from langchain_anthropic import ChatAnthropic
 
     cfg = _make_app_config(
@@ -508,7 +512,7 @@ def test_kimi_code_k3_normalizes_reasoning_effort(monkeypatch, model_id, input_e
 
     factory_module.create_chat_model(name=model_id, reasoning_effort=input_effort)
 
-    assert captured.get("model_kwargs") == {"reasoning_effort": expected_effort}
+    assert captured.get("model_kwargs") == {"extra_body": {"reasoning_effort": expected_effort}}
     assert "reasoning_effort" not in captured
 
 

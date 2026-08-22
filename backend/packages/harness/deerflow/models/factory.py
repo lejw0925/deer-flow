@@ -27,7 +27,12 @@ def _normalize_kimi_code_k3_reasoning_effort(
     runtime_settings: dict,
     configured_settings: dict,
 ) -> None:
-    """Translate Kimi Code K3 effort aliases and pass them through ChatAnthropic."""
+    """Translate Kimi Code K3 effort aliases and pass them through ChatAnthropic.
+
+    The anthropic SDK rejects unknown top-level kwargs on ``messages.create``
+    (``reasoning_effort`` is a Kimi extension), so the value must ride inside
+    ``extra_body`` to reach the request payload.
+    """
     if model_id not in _KIMI_CODE_K3_MODEL_IDS:
         return
 
@@ -45,13 +50,13 @@ def _normalize_kimi_code_k3_reasoning_effort(
     model_kwargs = dict(raw_model_kwargs or {})
     effort = runtime_effort if runtime_effort is not None else configured_effort
     if effort is None:
-        effort = model_kwargs.get("reasoning_effort")
+        effort = model_kwargs.pop("reasoning_effort", None)
     if effort is None:
         return
 
     if isinstance(effort, str):
         effort = _KIMI_CODE_K3_REASONING_EFFORTS.get(effort.casefold(), effort)
-    model_kwargs["reasoning_effort"] = effort
+    model_kwargs["extra_body"] = _deep_merge_dicts(model_kwargs.get("extra_body"), {"reasoning_effort": effort})
     configured_settings["model_kwargs"] = model_kwargs
 
 
